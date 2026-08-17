@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/manavjeet/Library/Arduino15/packages/**)",
+      "Read(//Users/manavjeet/Library/Arduino15/**)",
+      "Bash(grep -n \"XIAO_ESP32C6\" ~/Library/Arduino15/packages/esp32/hardware/esp32/*/boards.txt | head -5 *)",
+      "Read(//Users/manavjeet/Library/Arduino15/packages/esp32/hardware/esp32/**)",
+      "Bash(code --install-extension vsciot-vscode.vscode-arduino)",
+      "WebSearch",
+      "Bash(python3 -)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('Testing/testing_wifi.py'\\).read\\(\\)\\)\")",
+      "Bash(python3 -c \"import scipy; print\\(scipy.__version__\\)\")",
+      "Bash(/Users/manavjeet/git/BSTag-Firmware/.venv/bin/python -c \"import scipy; print\\(scipy.__version__\\)\")"
+    ]
+  }
+}

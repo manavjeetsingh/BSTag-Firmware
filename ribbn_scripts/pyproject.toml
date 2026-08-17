@@ -1,0 +1,18 @@
+[project]
+name = "ribbn_scripts"
+version = "0.0.1"
+authors = [
+  { name="Wings Lab", email="manavsingh@cs.stonybrook.edu" },
+]
+description = "Helper Scripts for RIBBN project"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/manavjeetsingh/T2TExperiments"
+Issues = "https://github.com/manavjeetsingh/T2TExperiments/issues"

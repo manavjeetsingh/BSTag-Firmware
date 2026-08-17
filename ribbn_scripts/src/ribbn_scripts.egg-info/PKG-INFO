@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: ribbn_scripts
+Version: 0.0.1
+Summary: Helper Scripts for RIBBN project
+Author-email: Wings Lab <manavsingh@cs.stonybrook.edu>
+Project-URL: Homepage, https://github.com/manavjeetsingh/T2TExperiments
+Project-URL: Issues, https://github.com/manavjeetsingh/T2TExperiments/issues
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+
+If you are here then you are not worthy of using this library.
