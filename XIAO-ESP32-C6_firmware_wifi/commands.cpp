@@ -1,0 +1,283 @@
+#include "commands.h"
+
+#include <WiFi.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "acquisition.h"
+#include "buffered_out.h"
+#include "config.h"
+#include "esync.h"
+#include "hardware.h"
+#include "net.h"
+#include "session.h"
+
+/* Deferred command slot. */
+static char queued_cmd[CMD_BUF_LEN] = {0};
+static bool queued_valid = false;
+static int  queued_session = 0;
+
+void printHelp(Print &out)
+{
+    out.println("Commands:");
+    out.println("  ch_<1-8>     switch RF/tag channel");
+    out.println("  adc          read one ADC sample");
+    out.println("  adc_<count>  read ADC samples, max 1000");
+    out.println("  adcraw       read one raw ADC code");
+    out.println("  adcraw_<n>   read raw ADC codes, max 1000");
+    out.println("  rdb          begin buffered capture on ch 2");
+    out.println("  rds          stop capture and dump buffer");
+    out.println("  spl          start plotter stream on ch 2");
+    out.println("  epl          stop plotter stream");
+    out.println("  esync        listen for exciter sync");
+    out.println("  esyncs       stop listening for exciter sync");
+    out.println("  q_<cmd>      queue <cmd>, run it on the next esync edge");
+    out.println("  q            show the queued command");
+    out.println("  qc           clear the queued command");
+    out.println("  mpp          one MPP channel sweep");
+    out.println("  mpp_<n>      n MPP sweeps, max 1000");
+    out.println("  net          show wifi status");
+    out.println("  help         show this message");
+}
+
+void queueCommand(const char *cmd, int session_idx)
+{
+    strncpy(queued_cmd, cmd, sizeof(queued_cmd) - 1);
+    queued_cmd[sizeof(queued_cmd) - 1] = '\0';
+    queued_session = session_idx;
+    queued_valid = true;
+}
+
+bool hasQueuedCommand(void)
+{
+    return queued_valid;
+}
+
+const char *queuedCommand(void)
+{
+    return queued_valid ? queued_cmd : "";
+}
+
+void clearQueuedCommand(void)
+{
+    queued_cmd[0] = '\0';
+    queued_valid = false;
+}
+
+void runQueuedCommand(void)
+{
+    if (!queued_valid) {
+        return;
+    }
+
+    /* Take a mutable copy and empty the slot before dispatching:
+     * handleCommand() trims in place, and running against a clear queue
+     * lets the command stage the next one itself. */
+    char cmd[CMD_BUF_LEN];
+    strncpy(cmd, queued_cmd, sizeof(cmd) - 1);
+    cmd[sizeof(cmd) - 1] = '\0';
+    int idx = queued_session;
+    clearQueuedCommand();
+
+    /* The session that staged it may be long gone; fall back to Serial. */
+    Stream *io = NULL;
+    if (idx >= 0 && idx < SESSION_COUNT) {
+        io = sessions[idx].io;
+    }
+    Print &sink = (io != NULL) ? *(Print *)io : *(Print *)&Serial;
+
+    BufferedOut out(sink);
+    handleCommand(cmd, out, idx);
+    out.done();
+}
+
+/* Strip leading/trailing whitespace (incl. CR from CRLF line endings). */
+static void trimInPlace(char *s)
+{
+    size_t n = strlen(s);
+    while (n > 0 && isspace((unsigned char)s[n - 1])) {
+        s[--n] = '\0';
+    }
+    char *start = s;
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+}
+
+void handleCommand(char *command, Print &out, int session_idx)
+{
+    trimInPlace(command);
+    if (command[0] == '\0') {
+        return;
+    }
+
+    if (strcmp(command, "help") == 0 || strcmp(command, "?") == 0) {
+        printHelp(out);
+        return;
+    }
+
+    if (strcmp(command, "net") == 0) {
+        printNetStatus(out);
+        return;
+    }
+    if (strcmp(command, "mac") == 0) {
+        out.printf("{\"mac\":\"%s\"}\n", WiFi.macAddress().c_str());
+        return;
+    }
+
+    if (strncmp(command, "ch_", 3) == 0) {
+        if (pathIsBusy()) {
+            out.println("ch:busy, stop capture/plotter first");
+            return;
+        }
+        uint8_t channel = (uint8_t)atoi(command + 3);
+        if (switchChannel(channel)) {
+            out.printf("ch: %u, ok\r\n", current_channel);
+        } else {
+            out.println("ch:invalid, use ch_1 ... ch_8");
+        }
+        return;
+    }
+
+    /* --- get ready for exciter sync ---*/
+
+    if (strcmp(command, "esync") == 0) {
+        esyncListen();
+        out.println("esync:listening");
+        return;
+    }
+
+    if (strcmp(command, "esyncs") == 0) {
+        esyncStop();
+        out.println("esync:stopped");
+        return;
+    }
+
+    /* --- deferred command --- */
+
+    if (strncmp(command, "q_", 2) == 0) {
+        const char *staged = command + 2;
+        if (staged[0] == '\0') {
+            out.println("q:empty, use q_<command>");
+            return;
+        }
+        queueCommand(staged, session_idx);
+        out.printf("q:queued, %s\n", queuedCommand());
+        return;
+    }
+
+    if (strcmp(command, "q") == 0) {
+        if (hasQueuedCommand()) {
+            out.printf("q:queued, %s\n", queuedCommand());
+        } else {
+            out.println("q:empty");
+        }
+        return;
+    }
+
+    if (strcmp(command, "qc") == 0) {
+        clearQueuedCommand();
+        out.println("q:cleared");
+        return;
+    }
+
+    /* --- buffered capture --- */
+
+    if (strcmp(command, "rdb") == 0) {
+        captureStart();
+        out.println("rdb");
+        return;
+    }
+
+    if (strcmp(command, "rds") == 0) {
+        captureStop();
+        dumpCapture(out);
+        captureReset();
+        return;
+    }
+
+    /* --- plotter stream --- */
+
+    if (strcmp(command, "spl") == 0) {
+        plotterStart(session_idx);
+        return;
+    }
+
+    if (strcmp(command, "epl") == 0) {
+        plotterStop();
+        return;
+    }
+
+    /* --- MPP sweep --- */
+
+    if (strcmp(command, "mpp") == 0 || strncmp(command, "mpp_", 4) == 0) {
+        if (pathIsBusy()) {
+            out.println("mpp:busy, stop capture/plotter first");
+            return;
+        }
+        uint16_t passes = 1;
+        if (command[3] == '_') {
+            passes = (uint16_t)atoi(command + 4);
+            if (passes == 0) {
+                passes = 1;
+            }
+            if (passes > MPP_MAX_PASSES) {
+                passes = MPP_MAX_PASSES;
+            }
+        }
+        runMppSweep(passes, out);
+        return;
+    }
+
+    /* --- one-shot / burst ADC reads --- */
+
+    bool is_adcraw_n = strncmp(command, "adcraw_", 7) == 0;
+    bool is_adcraw   = strcmp(command, "adcraw") == 0;
+    bool is_adc_n    = strncmp(command, "adc_", 4) == 0;
+    bool is_adc      = strcmp(command, "adc") == 0;
+
+    if (is_adc || is_adc_n || is_adcraw || is_adcraw_n) {
+        bool raw_output = is_adcraw || is_adcraw_n;
+        uint16_t count = 1;
+
+        if (is_adcraw_n) {
+            count = (uint16_t)atoi(command + 7);
+        } else if (is_adc_n) {
+            count = (uint16_t)atoi(command + 4);
+        }
+        if (is_adcraw_n || is_adc_n) {
+            if (count == 0) {
+                count = 1;
+            }
+            if (count > MAX_ADC_SAMPLES) {
+                count = MAX_ADC_SAMPLES;
+            }
+        }
+
+        out.print("{\"info\":\"adc\",\"ch\":");
+        out.print(current_channel);
+        out.print(",\"unit\":\"");
+        out.print(raw_output ? "raw" : "mV");
+        out.print("\",\"data\":\"");
+        for (uint16_t i = 0; i < count; i++) {
+            uint16_t raw = readAdcRaw();
+            if (raw_output) {
+                out.print(raw);
+            } else {
+                out.print(rawToMilliVolts(raw), 3);
+            }
+            if (i + 1 < count) {
+                out.print(",");
+            }
+        }
+        out.println("\"}");
+        return;
+    }
+
+    out.print("cmd:not found, ");
+    out.println(command);
+}
