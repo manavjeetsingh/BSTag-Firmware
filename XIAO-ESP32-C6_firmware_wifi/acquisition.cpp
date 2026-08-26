@@ -4,7 +4,7 @@
 #include "hardware.h"
 #include "session.h"
 
-static const uint8_t MPP_CHANNELS[] = {1, 3, 4, 6, 7, 8};
+static const uint8_t MPP_CHANNELS[] = {5, 5, 5, 5, 5, 5, 1, 3, 4, 6, 7, 8};
 #define MPP_CHANNEL_COUNT (sizeof(MPP_CHANNELS) / sizeof(MPP_CHANNELS[0]))
 
 static uint16_t capture_buf[CAPTURE_BUF_LEN];
@@ -140,5 +140,6 @@ void runMppSweep(uint16_t passes, Print &out)
             delay(MPP_DWELL_MS);
         }
     }
-    out.printf("mpp: %u pass, ch:%u, ok\n", passes, current_channel);
+    out.printf("{\"info\":\"mpp\",\"ch\":%u,\"passes\":%u,\"ok\":1}\n",
+               current_channel, passes);
 }

@@ -49,11 +49,11 @@ void serviceWifi(void)
             tcp_server.setNoDelay(true);
             server_started = true;
         }
-        Serial.printf("wifi:up, ip:%s, port:%u\n",
-                      WiFi.localIP().toString().c_str(), (unsigned)TCP_PORT);
+        // Serial.printf("wifi:up, ip:%s, port:%u\n",
+                    //   WiFi.localIP().toString().c_str(), (unsigned)TCP_PORT);
     } else if (!connected && wifi_up) {
         wifi_up = false;
-        Serial.println("wifi:down");
+        // Serial.println("wifi:down");
         for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
             tcp_clients[i].stop();
             sessionClose(i + 1);

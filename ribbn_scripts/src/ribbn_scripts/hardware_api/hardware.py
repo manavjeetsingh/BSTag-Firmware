@@ -128,7 +128,128 @@ class Tag:
         self._wifi_buf = self._wifi_buf[nl + 1:]
         return line
 
+    def listen_esync(self):
+        """
+            makes tag listen for esync
+        """
+        discard_read=self.ser.readline()
+        self.ser.write(bytes("esync"+"\r\n", "UTF8"))
+        c_str=bytes("esync:listening\r\n",'UTF8')
+        ts = time.time()
+        while True:
+            line = self.ser.readline()
+            # print(line)
+            if len(line) > 0:
+                print(line,'\t',c_str)
+                assert (line == c_str)
+                return
+
+            if time.time() - ts > 5:
+                raise Exception('no valid answer timeout')
+
+    def listen_esync_wifi(self, timeout=WIFI_TIMEOUT):
+        """
+            WiFi counterpart to listen_esync().
+        """
+        discard_read=self._wifi_readline()
+        self._wifi_write(bytes("esync"+"\r\n", "UTF8"))
+        c_str=bytes("esync:listening\r\n",'UTF8')
+        ts = time.time()
+        while True:
+            line = self._wifi_readline()
+            if len(line) > 0:
+                print(line,'\t',c_str)
+                assert (line == c_str)
+                return
+
+            if time.time() - ts > timeout:
+                raise Exception('no valid answer timeout')
+
+    def queue_any(self, command_str):
+        discard_read=self.ser.readline()
+        
+        q_command="q_"+command_str
+        c_str=bytes(f"q:queued, {command_str}\n",'UTF8')
+        self.ser.write(bytes(q_command+"\r\n", "UTF8"))
+        
+        ts = time.time()
+        while True:
+            line = self.ser.readline()
+            # print(line)
+            if len(line) > 0:
+                print(line,'\t',c_str)
+                assert (line == c_str)
+                return
+
+            if time.time() - ts > 5:
+                raise Exception('no valid answer timeout')
+        
+    
+    def queue_any_wifi(self, command_str, timeout=WIFI_TIMEOUT):
+        """
+            WiFi counterpart to queue_any().
+        """
+        discard_read=self._wifi_readline()
+
+        q_command="q_"+command_str
+        c_str=bytes(f"q:queued, {command_str}\n",'UTF8')
+        self._wifi_write(bytes(q_command+"\r\n", "UTF8"))
+
+        ts = time.time()
+        while True:
+            line = self._wifi_readline()
+            if len(line) > 0:
+                print(line,'\t',c_str)
+                assert (line == c_str)
+                return
+
+            if time.time() - ts > timeout:
+                raise Exception('no valid answer timeout')
+
+    def queue_adc_read(self, num_samples):
+        command=f"adc_{num_samples}"
+        self.queue_any(command)
+
+    def queue_adc_read_wifi(self, num_samples, timeout=WIFI_TIMEOUT):
+        command=f"adc_{num_samples}"
+        self.queue_any_wifi(command, timeout)
+
+    def queue_mpp(self, num):
+        command=f"mpp_{num}"
+        self.queue_any(command)
+
+    def queue_mpp_wifi(self, num, timeout=WIFI_TIMEOUT):
+        command=f"mpp_{num}"
+        self.queue_any_wifi(command, timeout)
+
+    def read_queued(self, timeout=None):
+        """
+            Blocks until the queued command fires on the next esync edge and
+            returns its reply, parsed as JSON. Works for any command whose
+            reply is a JSON blob (adc, adcraw, rds, mpp, mac, net); commands
+            that answer in plain text (ch_) will time out here.
+
+            Defaults to self.resetTime rather than the few seconds the other
+            calls use, since the wait is for the exciter edge, not the tag.
+        """
+        if timeout is None:
+            timeout = self.resetTime
+
+        return self._read_json(self.ser.readline, timeout, "read_queued")
+
+    def read_queued_wifi(self, timeout=None):
+        """
+            WiFi counterpart to read_queued(). Also defaults to
+            self.resetTime instead of WIFI_TIMEOUT: what is being waited on
+            is the exciter edge, which the link speed has no bearing on.
+        """
+        if timeout is None:
+            timeout = self.resetTime
+
+        return self._read_json(self._wifi_readline, timeout, "read_queued_wifi")
+    
     def reflect(self, ch):
+        discard_read=self.ser.readline()
         c_str = 'ch: ' + str(ch) + ', ok\r\n'
         c_str = bytes(c_str, "UTF8")
 
@@ -323,6 +444,49 @@ class Tag:
 
             return self.clean_buf_data(payload)
 
+    def _read_json(self, readline, timeout, what):
+        """
+            Accumulates bytes from `readline` until a balanced {...} blob can
+            be parsed, and returns it. Both transports poll without blocking
+            (serial timeout=0, socket timeout=0.05), so any reply bigger than
+            one read arrives split across several of them.
+        """
+        buffer = ""
+        read_start_time = time.time()
+        while True:
+            if time.time() - read_start_time > timeout:
+                raise Exception("Stuck in " + what)
+
+            line = readline()
+            if len(line) == 0:
+                continue
+
+            buffer += line.decode(errors='ignore')
+
+            start = buffer.find('{')
+            end = buffer.rfind('}')
+            if start == -1 or end == -1 or end < start:
+                continue
+
+            try:
+                return json.loads(buffer[start:end + 1])
+            except Exception:
+                continue
+
+    def clean_adc_data(self, payload):
+        """
+            Parses the "data" field of an adc JSON payload into an array of
+            floats: millivolts for "unit":"mV", ADC codes for "unit":"raw".
+        """
+        clean_data = []
+        for d in payload["data"].split(','):
+            try:
+                clean_data.append(float(d))
+            except Exception as e:
+                print(e)
+
+        return np.array(clean_data)
+
     def clean_buf_data(self, payload):
         """
             Parses the "data" field of a buffer JSON payload into an array of floats.
@@ -409,108 +573,60 @@ class Tag:
     def endPlotting_wifi(self):
         self._wifi_write(b"epl\0\n")
 
-    def get_adc_val(self):
-        # try:
-        #     assert (self.get_mac() is not None)
-        # except:
-        #     print("Invalid COM port MAC combination")
-        #     return None
+    def get_adc_val(self, count=30, raw=False, timeout=5):
+        """
+            Reads `count` ADC samples in one burst off the current channel.
+            The tag answers with a single JSON blob:
+            {"info":"adc","ch":2,"unit":"mV","data":"1.678,1.526,...,3.052"}
 
-        while True:
-            try:
-                # self.connect()
-                discard_read=self.ser.readline()
-                # print("DR",discard_read)
-                self.ser.write(b'adc30\0\n')
-                ts = time.time()
-                while True:
-                    line = self.ser.readline()
-                    if len(line) > 0:
-                        ss = str(line).split(',')
-                        assert (len(ss) > 5)
-                        # print(line)
-                        # v = np.median(np.array(ss[1:-1]).astype(float))
-                        v = np.array(ss[1:-1]).astype(float)
-                        # self.disconnect()
-                        return v
+            The firmware clamps `count` to MAX_ADC_SAMPLES (1000), so asking
+            for more just returns 1000 samples. raw=True issues adcraw_<n>
+            instead and returns unscaled ADC codes ("unit":"raw") rather
+            than millivolts.
+        """
+        cmd = "adcraw" if raw else "adc"
 
-                    if time.time() - ts > 5:
-                        raise Exception('no valid answer timeout')
-            except Exception as e:
-                print(e)
-                raise e
-            finally:
-                # self.disconnect()
-                pass
+        discard_read = self.ser.readline()
+        # print("DR",discard_read)
+        self.ser.write(f"{cmd}_{count}\0\n".encode())
+        payload = self._read_json(self.ser.readline, timeout, "get_adc_val")
 
-    def get_adc_val_wifi(self, timeout=WIFI_TIMEOUT):
+        return self.clean_adc_data(payload)
+
+    def get_adc_val_wifi(self, count=30, raw=False, timeout=WIFI_TIMEOUT):
         """
             WiFi counterpart to get_adc_val().
         """
-        while True:
-            try:
-                discard_read = self._wifi_readline()
-                self._wifi_write(b'adc30\0\n')
-                ts = time.time()
-                while True:
-                    line = self._wifi_readline()
-                    if len(line) > 0:
-                        ss = str(line).split(',')
-                        assert (len(ss) > 5)
-                        v = np.array(ss[1:-1]).astype(float)
-                        return v
+        cmd = "adcraw" if raw else "adc"
 
-                    if time.time() - ts > timeout:
-                        raise Exception('no valid answer timeout')
-            except Exception as e:
-                print(e)
-                raise e
-            finally:
-                pass
+        discard_read = self._wifi_readline()
+        self._wifi_write(f"{cmd}_{count}\0\n".encode())
+        payload = self._read_json(self._wifi_readline, timeout, "get_adc_val_wifi")
 
-    def get_mac(self):
+        return self.clean_adc_data(payload)
 
-        while True:
-            try:
-                discard_read=self.ser.readline()
-                # print("DR",discard_read)
-                self.ser.write(b'mac\0\n')
-                ts = time.time()
-                while True:
-                    line = self.ser.readline()
-                    if len(line) > 0:
-                        # assert (line in pos_mac.keys() and pos_mac[line]==self.com_str)
-                        # print(line)
-                        return line
+    def get_mac(self, timeout=5):
+        """
+            Asks the tag for its MAC. The reply is a JSON blob,
+            {"mac":"EC:62:60:4D:34:8C"}, and the address is returned as a
+            plain string.
+        """
+        discard_read=self.ser.readline()
+        # print("DR",discard_read)
+        self.ser.write(b'mac\0\n')
+        payload = self._read_json(self.ser.readline, timeout, "get_mac")
 
-                    if time.time() - ts > 5:
-                        raise Exception('no valid answer timeout')
-            except Exception as e:
-                print(e)
-            finally:
-                pass
-                # self.disconnect()
+        return payload["mac"]
 
     def get_mac_wifi(self, timeout=WIFI_TIMEOUT):
         """
             WiFi counterpart to get_mac().
         """
-        while True:
-            try:
-                discard_read = self._wifi_readline()
-                self._wifi_write(b'mac\0\n')
-                ts = time.time()
-                while True:
-                    line = self._wifi_readline()
-                    if len(line) > 0:
-                        return line
+        discard_read = self._wifi_readline()
+        self._wifi_write(b'mac\0\n')
+        payload = self._read_json(self._wifi_readline, timeout, "get_mac_wifi")
 
-                    if time.time() - ts > timeout:
-                        raise Exception('no valid answer timeout')
-            except Exception as e:
-                print(e)
-            finally:
-                pass
+        return payload["mac"]
 
 
 class VNA:

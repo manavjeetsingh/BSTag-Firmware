@@ -26,10 +26,10 @@ SAMP_RATE   = 2e6            # sample rate, sps
 TONE_OFFSET = 100e3          # CW tone offset from LO, Hz (0 = carrier at LO)
 AMPLITUDE   = 0.7            # 0..1, keep below 1.0 to avoid clipping
 
-DROP_MS     = 2            # length of the dropout
+DROP_MS     = 200            # length of the dropout
 RAMP_MS     = 1              # edge softening; 0 = hard keying
 
-RF_GAIN     = 50             # overall / VGA2
+RF_GAIN     = 60             # overall / VGA2
 IF_GAIN     = 20
 BB_GAIN     = 20
 DEVICE_ARGS = "bladerf=0"

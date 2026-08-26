@@ -216,7 +216,7 @@ void handleCommand(char *command, Print &out, int session_idx)
 
     if (strcmp(command, "mpp") == 0 || strncmp(command, "mpp_", 4) == 0) {
         if (pathIsBusy()) {
-            out.println("mpp:busy, stop capture/plotter first");
+            out.println("{\"info\":\"mpp\",\"ok\":0,\"err\":\"busy, stop capture/plotter first\"}");
             return;
         }
         uint16_t passes = 1;
