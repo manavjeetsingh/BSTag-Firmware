@@ -25,6 +25,6 @@ void servicePlotter(void);      /* call from loop() while plotterActive() */
 
 /* --- MPP sweep --- */
 
-void runMppSweep(uint16_t passes, Print &out);
+void runMppSweep(uint16_t passes, uint32_t dwell_us, Print &out);
 
 #endif /* ACQUISITION_H */

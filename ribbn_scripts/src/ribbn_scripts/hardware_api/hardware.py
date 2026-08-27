@@ -35,6 +35,8 @@ class Tag:
         self.ser = None
         self.sock = None
         self._wifi_buf = b''
+        self._wifi_host = None
+        self._wifi_port = None
         self.connect()
         self.resetTime=60 #sec
 
@@ -75,6 +77,8 @@ class Tag:
                 self.sock = socket.create_connection((host, port), timeout=timeout)
                 self.sock.settimeout(0.05)
                 self._wifi_buf = b''
+                self._wifi_host = host      # remembered for reconnect_wifi()
+                self._wifi_port = port
                 not_connected = 0
             except Exception:
                 print('couldnt connect via wifi. retrying in 1 sec')
@@ -99,6 +103,79 @@ class Tag:
             self.sock.close()
         except Exception:
             print('error disconnecting wifi')
+
+    def reconnect_wifi(self, deadline_s=60, poll_s=0.5, host=None, port=None):
+        """
+            Reopens the TCP channel the firmware dropped when it suspended
+            the radio for an esync window. No serial involved: retrying the
+            connect IS the readiness check, since the listener only comes
+            back once the radio is up.
+
+            That also makes this the signal that the window is over -- it
+            returns either because the edge fired or because the firmware
+            hit ESYNC_WIFI_TIMEOUT_MS. Ask qr which it was.
+
+            connect_wifi() retries forever, so the deadline lives here.
+        """
+        host = host if host is not None else self._wifi_host
+        port = port if port is not None else self._wifi_port
+        if host is None:
+            raise RuntimeError("no previous wifi connection to reconnect to")
+
+        if self.sock is not None:
+            self.disconnect_wifi()
+            self.sock = None
+
+        end = time.time() + deadline_s
+        last = None
+        while time.time() < end:
+            try:
+                sock = socket.create_connection((host, port), timeout=2.0)
+            except OSError as e:
+                last = e
+                time.sleep(poll_s)
+                continue
+
+            sock.settimeout(0.05)
+            self.sock = sock
+            self._wifi_buf = b''
+            self._wifi_host = host
+            self._wifi_port = port
+            return
+
+        raise TimeoutError(
+            f"{host}:{port} did not come back in {deadline_s}s, last: {last}")
+
+    def fetch_queued_wifi(self, timeout=WIFI_TIMEOUT):
+        """
+            Pulls the reply the firmware buffered while the radio was down.
+            Returns the command's own JSON, or {"info":"qr","pending":0} if
+            no queued command ran -- which is how a timed-out window (no
+            exciter edge) is told apart from a good one.
+        """
+        discard_read = self._wifi_readline()
+        self._wifi_write(bytes("qr\r\n", "UTF8"))
+        return self._read_json(self._wifi_readline, timeout, "fetch_queued_wifi")
+
+    def esync_report(self, timeout=WIFI_TIMEOUT):
+        """
+            Serial counterpart to esync_report_wifi(). The detector no longer
+            prints the edge as it happens -- that write sat between the edge
+            and the dispatch -- so this is how the timing is read back.
+        """
+        discard_read = self.ser.readline()
+        self.ser.write(bytes("esyncr\r\n", "UTF8"))
+        return self._read_json(self.ser.readline, timeout, "esync_report")
+
+    def esync_report_wifi(self, timeout=WIFI_TIMEOUT):
+        """
+            The edge that fired the queued command: t_us, low_us, and the
+            min/baseline levels it was judged against. Useful for checking
+            threshold margin and for comparing low_us across tags.
+        """
+        discard_read = self._wifi_readline()
+        self._wifi_write(bytes("esyncr\r\n", "UTF8"))
+        return self._read_json(self._wifi_readline, timeout, "esync_report_wifi")
 
     def _wifi_write(self, data):
         self.sock.sendall(data)

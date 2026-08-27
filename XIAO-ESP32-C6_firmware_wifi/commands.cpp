@@ -18,6 +18,62 @@ static char queued_cmd[CMD_BUF_LEN] = {0};
 static bool queued_valid = false;
 static int  queued_session = 0;
 
+/* Deferred reply, captured when the staging session is gone. */
+static char   reply_buf[QUEUED_REPLY_BUF_LEN];
+static size_t reply_len = 0;
+static bool   reply_valid = false;
+static bool   reply_overflow = false;
+static char   reply_for[CMD_BUF_LEN] = {0};
+
+/* Print sink over reply_buf. Truncates rather than growing; the overflow
+ * flag turns a silently-cut JSON blob into an explicit error on qr. */
+class DeferredOut : public Print {
+public:
+    size_t write(uint8_t c) override
+    {
+        if (reply_len >= sizeof(reply_buf)) {
+            reply_overflow = true;
+            return 0;
+        }
+        reply_buf[reply_len++] = (char)c;
+        return 1;
+    }
+
+    size_t write(const uint8_t *data, size_t len) override
+    {
+        size_t space = sizeof(reply_buf) - reply_len;
+        size_t take  = (len < space) ? len : space;
+        if (take < len) {
+            reply_overflow = true;
+        }
+        memcpy(reply_buf + reply_len, data, take);
+        reply_len += take;
+        return len;   /* claim it all; the flag carries the loss */
+    }
+};
+
+void clearQueuedReply(void)
+{
+    reply_len = 0;
+    reply_valid = false;
+    reply_overflow = false;
+    reply_for[0] = '\0';
+}
+
+void dumpQueuedReply(Print &out)
+{
+    if (!reply_valid) {
+        out.println("{\"info\":\"qr\",\"pending\":0}");
+        return;
+    }
+    if (reply_overflow) {
+        out.printf("{\"info\":\"qr\",\"pending\":1,\"err\":\"overflow\","
+                   "\"cmd\":\"%s\"}\n", reply_for);
+        return;
+    }
+    out.write((const uint8_t *)reply_buf, reply_len);
+}
+
 void printHelp(Print &out)
 {
     out.println("Commands:");
@@ -32,6 +88,8 @@ void printHelp(Print &out)
     out.println("  epl          stop plotter stream");
     out.println("  esync        listen for exciter sync");
     out.println("  esyncs       stop listening for exciter sync");
+    out.println("  esyncr       report the last exciter sync edge");
+    out.println("  qr           reply the queued command left behind");
     out.println("  q_<cmd>      queue <cmd>, run it on the next esync edge");
     out.println("  q            show the queued command");
     out.println("  qc           clear the queued command");
@@ -70,7 +128,6 @@ void runQueuedCommand(void)
     if (!queued_valid) {
         return;
     }
-
     /* Take a mutable copy and empty the slot before dispatching:
      * handleCommand() trims in place, and running against a clear queue
      * lets the command stage the next one itself. */
@@ -80,16 +137,28 @@ void runQueuedCommand(void)
     int idx = queued_session;
     clearQueuedCommand();
 
-    /* The session that staged it may be long gone; fall back to Serial. */
     Stream *io = NULL;
     if (idx >= 0 && idx < SESSION_COUNT) {
         io = sessions[idx].io;
     }
-    Print &sink = (io != NULL) ? *(Print *)io : *(Print *)&Serial;
 
-    BufferedOut out(sink);
-    handleCommand(cmd, out, idx);
-    out.done();
+    if (io != NULL) {
+        BufferedOut out(*(Print *)io);
+        handleCommand(cmd, out, idx, true);
+        out.done();
+        return;
+    }
+
+    /* No session left -- almost always because the esync window took the
+     * radio down. Capture the reply so qr can hand it over once the host
+     * is back, instead of writing it into a closed socket. */
+    clearQueuedReply();
+    strncpy(reply_for, cmd, sizeof(reply_for) - 1);
+    reply_for[sizeof(reply_for) - 1] = '\0';
+
+    DeferredOut dout;
+    handleCommand(cmd, dout, idx, true);
+    reply_valid = true;
 }
 
 /* Strip leading/trailing whitespace (incl. CR from CRLF line endings). */
@@ -108,7 +177,7 @@ static void trimInPlace(char *s)
     }
 }
 
-void handleCommand(char *command, Print &out, int session_idx)
+void handleCommand(char *command, Print &out, int session_idx, bool from_queue)
 {
     trimInPlace(command);
     if (command[0] == '\0') {
@@ -185,6 +254,18 @@ void handleCommand(char *command, Print &out, int session_idx)
         return;
     }
 
+    /* Reply the queued command produced while the radio was down, and the
+     * edge that triggered it. Both survive until the next esync arms. */
+    if (strcmp(command, "qr") == 0) {
+        dumpQueuedReply(out);
+        return;
+    }
+
+    if (strcmp(command, "esyncr") == 0) {
+        esyncReport(out);
+        return;
+    }
+
     /* --- buffered capture --- */
 
     if (strcmp(command, "rdb") == 0) {
@@ -229,7 +310,12 @@ void handleCommand(char *command, Print &out, int session_idx)
                 passes = MPP_MAX_PASSES;
             }
         }
-        runMppSweep(passes, out);
+
+        if (from_queue) {
+            delay(5);
+        }
+
+        runMppSweep(passes, from_queue ? MPP_DWELL_QUEUED_US : MPP_DWELL_US, out);
         return;
     }
 

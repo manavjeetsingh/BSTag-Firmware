@@ -23,7 +23,7 @@
 
 #define SERIAL_BAUD            921600UL
 #define SPI_CLOCK_HZ           40000000UL
-#define MAX_ADC_SAMPLES        1000
+#define MAX_ADC_SAMPLES        1500
 #define ADC_REF_MV             5000.0f
 #define CMD_BUF_LEN            32     /* max command length incl. terminator */
 #define OUT_CHUNK_LEN          1024   /* TX coalescing buffer, see BufferedOut */
@@ -44,15 +44,34 @@
 #define ESYNC_CHANNEL          2      /* RX channel forced on esync */
 #define ESYNC_WARMUP_SAMPLES   1000   /* samples used to seed the baseline */
 #define ESYNC_MIN_BASELINE_MV  2.0f   /* floor level: at or under this is a drop */
-#define ESYNC_REARM_PCT        25     /* % below baseline that counts as back up */
+#define ESYNC_REARM_PCT        50     /* % below baseline that counts as back up.
+                                        50 puts the crossing at the steepest
+                                        point of the exciter ramp, where a
+                                        given amplitude mismatch between tags
+                                        costs the least timing error. Needs a
+                                        baseline above 2*ESYNC_MIN_BASELINE_MV
+                                        to stay clear of the arm floor. */
 #define ESYNC_BASELINE_SHIFT   10     /* baseline IIR time constant, 1<<n samples */
+#define ESYNC_WIFI_QUIET_MS    50     /* ack drain before the radio goes down */
+#define ESYNC_WIFI_TIMEOUT_MS  30000  /* no edge by now: bring the radio back */
+
+/* Deferred reply. The queued command fires while the radio is down, so
+ * its reply is captured here and handed over with qr after the host
+ * reconnects. Sized for the worst case, MAX_ADC_SAMPLES in mV: each
+ * sample prints as up to "5000.000," = 9 B, plus the header. Raising
+ * MAX_ADC_SAMPLES without raising this makes qr answer with an overflow
+ * error instead of the trace. */
+#define QUEUED_REPLY_BUF_LEN   16384
 
 /* Streaming plotter (spl/epl). Emits bare numbers for Arduino Serial Plotter. */
 #define PLOTTER_CHANNEL        2      /* channel forced on spl */
 #define PLOTTER_PERIOD_MS      50
 
 /* MPP sweep. */
-#define MPP_DWELL_MS           1
+/* Per-channel dwell. The esync-fired sweep gets its own value so the
+ * synchronised run can dwell differently from an interactive probe. */
+#define MPP_DWELL_US           1000   /* interactive mpp/mpp_<n> */
+#define MPP_DWELL_QUEUED_US    3000   /* mpp fired by the esync detector */
 #define MPP_MAX_PASSES         1000
 
 #define SESSION_COUNT          (1 + MAX_TCP_CLIENTS)   /* slot 0 is Serial */

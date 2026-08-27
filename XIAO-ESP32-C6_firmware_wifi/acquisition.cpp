@@ -4,7 +4,7 @@
 #include "hardware.h"
 #include "session.h"
 
-static const uint8_t MPP_CHANNELS[] = {5, 5, 5, 5, 5, 5, 1, 3, 4, 6, 7, 8};
+static const uint8_t MPP_CHANNELS[] = {1, 1, 1, 1,  3, 4, 6, 7, 8};
 #define MPP_CHANNEL_COUNT (sizeof(MPP_CHANNELS) / sizeof(MPP_CHANNELS[0]))
 
 static uint16_t capture_buf[CAPTURE_BUF_LEN];
@@ -132,12 +132,25 @@ void servicePlotter(void)
 /* MPP sweep                                                           */
 /* ------------------------------------------------------------------ */
 
-void runMppSweep(uint16_t passes, Print &out)
+/* Whole milliseconds go through delay() so the sweep keeps yielding and
+ * WiFi/TCP stay serviced; only the sub-millisecond remainder is spun. */
+static void mppDwell(uint32_t us)
+{
+    if (us >= 1000UL) {
+        delay(us / 1000UL);
+    }
+    uint32_t rem = us % 1000UL;
+    if (rem > 0) {
+        delayMicroseconds(rem);
+    }
+}
+
+void runMppSweep(uint16_t passes, uint32_t dwell_us, Print &out)
 {
     for (uint16_t pass = 0; pass < passes; pass++) {
         for (size_t i = 0; i < MPP_CHANNEL_COUNT; i++) {
             switchChannel(MPP_CHANNELS[i]);
-            delay(MPP_DWELL_MS);
+            mppDwell(dwell_us);
         }
     }
     out.printf("{\"info\":\"mpp\",\"ch\":%u,\"passes\":%u,\"ok\":1}\n",

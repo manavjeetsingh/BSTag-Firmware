@@ -11,6 +11,7 @@ static WiFiClient tcp_clients[MAX_TCP_CLIENTS];
 static bool       wifi_enabled = false;
 static bool       wifi_up = false;
 static bool       server_started = false;
+static bool       wifi_suspended = false;
 
 void wifiStart(void)
 {
@@ -32,11 +33,49 @@ void wifiStart(void)
     Serial.println("wifi:connecting");
 }
 
+void wifiSuspend(void)
+{
+    if (!wifi_enabled || wifi_suspended) {
+        return;
+    }
+
+    for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
+        tcp_clients[i].stop();
+        sessionClose(i + 1);
+    }
+    if (server_started) {
+        tcp_server.end();
+        server_started = false;
+    }
+
+    WiFi.disconnect(true);       /* true = power the radio down */
+    WiFi.mode(WIFI_OFF);
+
+    wifi_up = false;
+    wifi_suspended = true;
+}
+
+void wifiResume(void)
+{
+    if (!wifi_enabled || !wifi_suspended) {
+        return;
+    }
+
+    wifi_suspended = false;
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);   /* serviceWifi() restarts the server */
+}
+
+bool wifiSuspended(void)
+{
+    return wifi_suspended;
+}
+
 void serviceWifi(void)
 {
     static uint32_t last_attempt_ms = 0;
 
-    if (!wifi_enabled) {
+    if (!wifi_enabled || wifi_suspended) {
         return;
     }
 
@@ -71,7 +110,7 @@ void serviceWifi(void)
 
 void serviceTcp(void)
 {
-    if (!server_started) {
+    if (wifi_suspended || !server_started) {
         return;
     }
 
@@ -114,6 +153,10 @@ void printNetStatus(Print &out)
 {
     if (!wifi_enabled) {
         out.println("{\"net\":\"disabled\"}");
+        return;
+    }
+    if (wifi_suspended) {
+        out.println("{\"net\":\"suspended\"}");
         return;
     }
     if (!wifi_up) {

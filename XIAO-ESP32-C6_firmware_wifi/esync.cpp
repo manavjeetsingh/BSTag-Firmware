@@ -22,11 +22,55 @@ static int32_t  esync_base_acc = 0;     /* baseline << ESYNC_BASELINE_SHIFT */
 static uint32_t esync_low_enter_us = 0;
 static uint16_t esync_low_min = 0;
 
+/* Last edge, latched for esyncReport(). Printing from the detector would
+ * put a blocking USB/UART write between the edge and runQueuedCommand(),
+ * which is exactly the latency this whole path exists to avoid. */
+static bool     esync_rep_valid = false;
+static uint32_t esync_rep_t_us = 0;
+static uint32_t esync_rep_low_us = 0;
+static uint16_t esync_rep_min = 0;
+static uint16_t esync_rep_base = 0;
+
 void esyncListen(void)
 {
     switchChannel(ESYNC_CHANNEL);
     esyncReset();
+    /* A new run invalidates the last one: better to report nothing than
+     * to hand back a stale edge or a stale reply. */
+    esyncClearReport();
+    clearQueuedReply();
     listen_for_esync = true;
+}
+
+void esyncClearReport(void)
+{
+    esync_rep_valid = false;
+}
+
+void esyncReport(Print &out)
+{
+    if (!esync_rep_valid) {
+        /* Nothing has fired. Report what the detector is actually doing so
+         * a silent run can be told apart from a stuck one: not primed means
+         * the warmup window has not filled, armed means it saw the drop and
+         * is waiting for the rise. */
+        int32_t base = esync_base_acc >> ESYNC_BASELINE_SHIFT;
+        out.printf("{\"info\":\"esync\",\"pending\":0,\"listening\":%d,"
+                   "\"primed\":%d,\"armed\":%d,\"samples\":%lu,"
+                   "\"base_mv\":%.3f}\n",
+                   listen_for_esync ? 1 : 0,
+                   esync_primed ? 1 : 0,
+                   esync_high ? 0 : 1,
+                   (unsigned long)esync_count,
+                   rawToMilliVolts((uint16_t)base));
+        return;
+    }
+    out.printf("{\"info\":\"esync\",\"edge\":\"rise\",\"t_us\":%lu,"
+               "\"low_us\":%lu,\"min_mv\":%.3f,\"base_mv\":%.3f}\n",
+               (unsigned long)esync_rep_t_us,
+               (unsigned long)esync_rep_low_us,
+               rawToMilliVolts(esync_rep_min),
+               rawToMilliVolts(esync_rep_base));
 }
 
 void esyncStop(void)
@@ -136,12 +180,11 @@ void esyncListening(void)
         uint32_t now_us = micros();
         uint32_t low_us = now_us - esync_low_enter_us;
 
-        Serial.printf("{\"info\":\"esync\",\"edge\":\"rise\",\"t_us\":%lu,"
-                      "\"low_us\":%lu,\"min_mv\":%.3f,\"base_mv\":%.3f}\n",
-                      (unsigned long)now_us,
-                      (unsigned long)low_us,
-                      rawToMilliVolts(esync_low_min),
-                      rawToMilliVolts((uint16_t)baseline));
+        esync_rep_t_us   = now_us;
+        esync_rep_low_us = low_us;
+        esync_rep_min    = esync_low_min;
+        esync_rep_base   = (uint16_t)baseline;
+        esync_rep_valid  = true;
 
         /* One shot: disarm before dispatching, so a queued esync can
          * re-arm us cleanly instead of being undone by the stop. */
