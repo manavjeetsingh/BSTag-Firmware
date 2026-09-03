@@ -18,4 +18,6 @@ uint16_t readAdcRaw(void);
 float    rawToMilliVolts(uint16_t raw);
 uint16_t milliVoltsToRaw(float mv);
 
+bool readD0(void);
+
 #endif /* HARDWARE_H */

@@ -30,6 +30,8 @@ void hardwareInit(void)
     setStatusLed(true);
     setUserLed(false);
 
+    pinMode(PIN_D0, INPUT);
+
     pinMode(PIN_RF_V1, OUTPUT);
     pinMode(PIN_RF_V2, OUTPUT);
     pinMode(PIN_RF_V3, OUTPUT);
@@ -64,6 +66,11 @@ bool switchChannel(uint8_t channel)
     digitalWrite(PIN_RF_V3, levels[2]);
     current_channel = channel;
     return true;
+}
+
+bool readD0(void)
+{
+    return digitalRead(PIN_D0) == HIGH;
 }
 
 uint16_t readAdcRaw(void)

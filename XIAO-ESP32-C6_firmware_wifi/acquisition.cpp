@@ -124,7 +124,10 @@ void servicePlotter(void)
     uint32_t now = millis();
     if (now - plotter_last_ms >= PLOTTER_PERIOD_MS) {
         plotter_last_ms = now;
-        sessions[plotter_session].io->println(rawToMilliVolts(readAdcRaw()), 3);
+        Print &io = *sessions[plotter_session].io;
+        io.print(rawToMilliVolts(readAdcRaw()), 3);
+        io.print(",");
+        io.println(readD0() ? 1 : 0);
     }
 }
 

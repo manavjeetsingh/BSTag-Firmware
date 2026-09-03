@@ -19,6 +19,7 @@
 #define PIN_POWER_EN           23   /* D5 */
 #define PIN_STATUS_LED         16   /* D6 */
 #define PIN_USER_LED           15   /* Built-in LED, active-low */
+#define PIN_D0                  0   /* D0 */
 #define POWER_EN_ACTIVE_LEVEL  HIGH
 
 #define SERIAL_BAUD            921600UL
@@ -34,12 +35,34 @@
 
 /* Exciter sync (esync). Moving window of raw codes: 2 bytes/sample.
  *
- * The signal must fall to the floor, ESYNC_MIN_BASELINE_MV or below, to
- * arm the detector; a rising edge is then reported once it climbs back
- * to within ESYNC_REARM_PCT of the tracked idle level. How often the
- * drops happen never enters into it. The baseline only follows the
- * signal while it is at rest, so a drop cannot drag it down however long
- * it lasts. */
+ * The exciter sends a framed packet, not a bare drop:
+ *
+ *      idle    SFD (40 ms)   guard   8 chips, 2 ms each      idle
+ *      ────┐               ┌─────┐ ┌──┐    ┌──┐  ┌────┐  ┌────────
+ *          └───────────────┘     └─┘  └────┘  └──┘    └──┘
+ *                          ^
+ *                        t_sfd
+ *
+ * Detection and timing are deliberately split. The SFD is a long blank --
+ * a Manchester code violation, since no run inside the payload can exceed
+ * one bit period -- so it cannot be mistaken for payload and marks the
+ * frame start unambiguously however late a tag started listening. Its
+ * rising edge is the single timing reference: it follows a deep, settled
+ * blank, so it is the sharpest, highest-SNR edge in the packet.
+ *
+ * The payload is validation only. Both halves of every Manchester bit
+ * must differ, which a fade or a stray dropout will not produce, and the
+ * 4 bits it carries are an id the exciter increments per packet, so a run
+ * can prove every tag locked onto the same one. The queued command then
+ * fires at ESYNC_FIRE_OFFSET_US past t_sfd rather than on any payload
+ * edge -- a fixed offset off a crystal costs ~1 us of drift over 24 ms,
+ * far less than the spread in where each tag's decode happens to finish.
+ *
+ * The baseline only follows the signal while it is at rest, so a drop
+ * cannot drag it down however long it lasts.
+ *
+ * Everything here is mirrored in BladeRFCode/manchester_sync/manual_sync.py;
+ * the packet shape has to be edited in both places at once. */
 #define ESYNC_BUF_LEN          10000
 #define ESYNC_CHANNEL          2      /* RX channel forced on esync */
 #define ESYNC_WARMUP_SAMPLES   1000   /* samples used to seed the baseline */
@@ -53,7 +76,34 @@
                                         to stay clear of the arm floor. */
 #define ESYNC_BASELINE_SHIFT   10     /* baseline IIR time constant, 1<<n samples */
 #define ESYNC_WIFI_QUIET_MS    50     /* ack drain before the radio goes down */
-#define ESYNC_WIFI_TIMEOUT_MS  30000  /* no edge by now: bring the radio back */
+#define ESYNC_WIFI_TIMEOUT_MS  30000  /* no packet by now: bring the radio back */
+
+/* Packet shape. The SFD window is wide because it only has to separate a
+ * 40 ms blank from anything the environment produces by accident; the
+ * tags' own measurement error is a sample period, some tens of us. */
+#define ESYNC_SFD_MIN_US       35000  /* accepted SFD blank, low end */
+#define ESYNC_SFD_MAX_US       45000  /* accepted SFD blank, high end */
+#define ESYNC_GUARD_US          4000  /* carrier between the SFD and chip 0 */
+#define ESYNC_CHIP_US           2000  /* one chip; a bit is two of them */
+#define ESYNC_PKT_BITS             4
+#define ESYNC_PKT_CHIPS        (2 * ESYNC_PKT_BITS)
+#define ESYNC_PAYLOAD_END_US   (ESYNC_GUARD_US + ESYNC_PKT_CHIPS * ESYNC_CHIP_US)
+
+/* When the queued command fires, measured from t_sfd. Must clear
+ * ESYNC_PAYLOAD_END_US so the packet is fully validated first; the slack
+ * is what the decode and the dispatch have to fit into. */
+#define ESYNC_FIRE_OFFSET_US   24000
+
+/* Chips are sliced from the middle half of their window only -- the edges
+ * are ramp and loop jitter. A chip that collected fewer samples than this
+ * means the sample loop stalled through it, so the packet is dropped
+ * rather than sliced on thin evidence. */
+#define ESYNC_CHIP_MIN_SAMPLES     8
+
+/* Require a particular id, or -1 to accept any well-formed packet and
+ * report whichever id it carried. Pin it only when something else on the
+ * band is also sending packets this detector would accept. */
+#define ESYNC_PKT_REQUIRE_ID      (-1)
 
 /* Deferred reply. The queued command fires while the radio is down, so
  * its reply is captured here and handed over with qr after the host
@@ -63,7 +113,8 @@
  * error instead of the trace. */
 #define QUEUED_REPLY_BUF_LEN   16384
 
-/* Streaming plotter (spl/epl). Emits bare numbers for Arduino Serial Plotter. */
+/* Streaming plotter (spl/epl). Emits "mV,d0_level" per line for Arduino
+ * Serial Plotter, mV as the ADC channel voltage, d0_level as 0 or 1. */
 #define PLOTTER_CHANNEL        2      /* channel forced on spl */
 #define PLOTTER_PERIOD_MS      50
 

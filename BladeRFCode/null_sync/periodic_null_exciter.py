@@ -27,11 +27,11 @@ SAMP_RATE   = 2e6            # sample rate, sps
 TONE_OFFSET = 100e3          # CW tone offset from LO, Hz (0 = carrier at LO)
 AMPLITUDE   = 0.8            # 0..1, keep below 1.0 to avoid clipping
 
-PERIOD_S    = 1.0            # blank once per this many seconds
-BLANK_MS    = 200             # how long the output stays at zero
+PERIOD_S    = 4.0            # blank once per this many seconds
+BLANK_MS    = 2000             # how long the output stays at zero
 RAMP_MS     = 1              # edge softening; 0 = hard keying (see note below)
 
-RF_GAIN     = 50             # overall / VGA2
+RF_GAIN     = 60             # overall / VGA2
 IF_GAIN     = 20
 BB_GAIN     = 20
 DEVICE_ARGS = "bladerf=0"

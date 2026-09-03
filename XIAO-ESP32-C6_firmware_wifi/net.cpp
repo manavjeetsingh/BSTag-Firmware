@@ -12,6 +12,7 @@ static bool       wifi_enabled = false;
 static bool       wifi_up = false;
 static bool       server_started = false;
 static bool       wifi_suspended = false;
+static uint32_t   last_attempt_ms = 0;   /* last WiFi.begin(), shared with the retry timer */
 
 void wifiStart(void)
 {
@@ -30,6 +31,7 @@ void wifiStart(void)
     WiFi.setSleep(false);            /* no modem sleep: lower RTT, more mA */
 #endif
     WiFi.begin(WIFI_SSID, WIFI_PASS);
+    last_attempt_ms = millis();
     Serial.println("wifi:connecting");
 }
 
@@ -64,6 +66,7 @@ void wifiResume(void)
     wifi_suspended = false;
     WiFi.mode(WIFI_STA);
     WiFi.begin(WIFI_SSID, WIFI_PASS);   /* serviceWifi() restarts the server */
+    last_attempt_ms = millis();         /* don't let the retry timer double this up */
 }
 
 bool wifiSuspended(void)
@@ -73,8 +76,6 @@ bool wifiSuspended(void)
 
 void serviceWifi(void)
 {
-    static uint32_t last_attempt_ms = 0;
-
     if (!wifi_enabled || wifi_suspended) {
         return;
     }
@@ -99,13 +100,9 @@ void serviceWifi(void)
         }
     }
 
-    if (!connected) {
-        uint32_t now = millis();
-        if (now - last_attempt_ms >= WIFI_RETRY_MS) {
-            last_attempt_ms = now;
-            WiFi.begin(WIFI_SSID, WIFI_PASS);
-        }
-    }
+    /* WiFi.setAutoReconnect(true) (wifiStart()) already retries internally
+     * on disconnect -- calling begin() again here would race that in-flight
+     * attempt and trip "sta is connecting, cannot set config" every tick. */
 }
 
 void serviceTcp(void)

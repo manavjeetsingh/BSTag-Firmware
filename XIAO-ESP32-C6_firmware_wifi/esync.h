@@ -4,10 +4,14 @@
 #include <Arduino.h>
 
 /* Exciter sync. `esync` arms the listener; loop() then samples the RX
- * channel as fast as it can go. The listener is one shot: the first
- * rising edge is latched, the listener disarms itself, and whatever was
- * staged with q_<cmd> runs at that instant. Nothing is printed from the
- * detector: read the edge with esyncr and the command's reply with qr. */
+ * channel as fast as it can go, looking for the framed packet described
+ * in config.h -- a long SFD blank, then four Manchester bits carrying an
+ * id. The listener is one shot: the first well-formed packet latches its
+ * timing, the listener disarms itself, and whatever was staged with
+ * q_<cmd> runs at a fixed offset from the SFD edge. A packet that fails
+ * any check is dropped and listening continues. Nothing is printed from
+ * the detector: read the packet with esyncr and the command's reply with
+ * qr. */
 
 /* Arm: force the RX channel, clear the window, start listening. */
 void esyncListen(void);

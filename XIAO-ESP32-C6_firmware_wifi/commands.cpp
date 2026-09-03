@@ -84,7 +84,7 @@ void printHelp(Print &out)
     out.println("  adcraw_<n>   read raw ADC codes, max 1000");
     out.println("  rdb          begin buffered capture on ch 2");
     out.println("  rds          stop capture and dump buffer");
-    out.println("  spl          start plotter stream on ch 2");
+    out.println("  spl          start plotter stream on ch 2 (mV,d0_level)");
     out.println("  epl          stop plotter stream");
     out.println("  esync        listen for exciter sync");
     out.println("  esyncs       stop listening for exciter sync");
@@ -96,6 +96,9 @@ void printHelp(Print &out)
     out.println("  mpp          one MPP channel sweep");
     out.println("  mpp_<n>      n MPP sweeps, max 1000");
     out.println("  net          show wifi status");
+    out.println("  wifi_off     stop the radio (drops TCP sessions)");
+    out.println("  wifi_on      re-associate the radio");
+    out.println("  d0           read D0 pin level");
     out.println("  help         show this message");
 }
 
@@ -195,6 +198,20 @@ void handleCommand(char *command, Print &out, int session_idx, bool from_queue)
     }
     if (strcmp(command, "mac") == 0) {
         out.printf("{\"mac\":\"%s\"}\n", WiFi.macAddress().c_str());
+        return;
+    }
+    if (strcmp(command, "wifi_off") == 0) {
+        out.println("wifi:off");
+        wifiSuspend();
+        return;
+    }
+    if (strcmp(command, "wifi_on") == 0) {
+        wifiResume();
+        out.println("wifi:on");
+        return;
+    }
+    if (strcmp(command, "d0") == 0) {
+        out.printf("{\"info\":\"d0\",\"level\":%d}\n", readD0() ? 1 : 0);
         return;
     }
 
