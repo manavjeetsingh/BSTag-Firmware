@@ -1,7 +1,5 @@
 #include "esync.h"
 
-#include <string.h>
-
 #include "commands.h"
 #include "config.h"
 #include "hardware.h"
@@ -18,48 +16,52 @@ static uint32_t esync_sample_us = 0; /* micros() of the newest sample */
 /* Detector state. */
 static uint16_t esync_drop_thr = 0;     /* fixed floor, in raw codes */
 static bool     esync_primed = false;   /* baseline seeded, level state known */
+static bool     esync_high = true;      /* false while the signal is dropped */
 static int32_t  esync_base_acc = 0;     /* baseline << ESYNC_BASELINE_SHIFT */
 
-/* Packet state machine. Every rejection lands back in PKT_IDLE with the
- * listener still armed: a tag that misfires on a half-seen packet would
- * run its queued command at a time no other tag shares, which is worse
- * for the experiment than a tag that simply never fired. */
-typedef enum {
-    PKT_IDLE = 0,   /* carrier up, waiting for a blank to start */
-    PKT_SFD,        /* inside a blank, timing it */
-    PKT_PAYLOAD     /* SFD accepted, binning chip samples off t_sfd */
-} PktState;
-
-static PktState esync_state = PKT_IDLE;
+/* The pending fire. Latched at the falling edge and committed to from
+ * that moment: once armed, the only thing that can call it off is the
+ * carrier coming back early. */
+static bool     esync_fire_armed = false;
+static uint32_t esync_fire_at_us = 0;
 
 /* Stats for the blank currently in progress. */
 static uint32_t esync_low_enter_us = 0;
 static uint16_t esync_low_min = 0;
-static uint32_t esync_sfd_len_us = 0;
+/* The blank's measured length, filled in if the carrier returns before
+ * the fire deadline. Zero at fire time means it had not come back yet. */
+static uint32_t esync_low_us = 0;
 
-/* Payload capture. */
-static uint32_t esync_t_sfd_us = 0;
-static uint32_t esync_chip_sum[ESYNC_PKT_CHIPS];
-static uint16_t esync_chip_n[ESYNC_PKT_CHIPS];
+/* Lowest sample since arming. A run where nothing fires and this never
+ * drops near the floor means the blank is not reaching ESYNC_MIN_BASELINE_MV
+ * at all, which no amount of widening the length window will fix. */
+static uint16_t esync_seen_min = 0xFFFF;
 
-/* Rejection tallies, so a run that never fires can be diagnosed without
- * a scope: which test the environment keeps failing says what to widen. */
-static uint16_t esync_rej_sfd = 0;    /* blank, but the wrong length */
-static uint16_t esync_rej_chip = 0;   /* payload not well-formed Manchester */
-static uint16_t esync_rej_id = 0;     /* decoded, but not the pinned id */
-static uint16_t esync_rej_late = 0;   /* decode overran the fire instant */
+/* Rejection tally, so a run that never fires says why without a scope:
+ * the floor was reached but the carrier came back before
+ * ESYNC_BLANK_MIN_US -- a fade rather than a blank. It is decided inside
+ * the delay window, while calling the fire off is still possible.
+ *
+ * A blank too SHALLOW to be real needs no tally: the falling edge is the
+ * floor test, so a sag that never reaches ESYNC_MIN_BASELINE_MV never
+ * latches an edge in the first place. min_mv against base_mv is what says
+ * so, exactly as it did before anything fired.
+ *
+ * There is deliberately no rej_long counterpart either. A blank that
+ * overruns is only knowable after the tag has already fired against it,
+ * so it cannot be a rejection -- it comes back as the "long" flag on the
+ * fired report. */
+static uint16_t esync_rej_short = 0;
 
-/* Last packet, latched for esyncReport(). Printing from the detector
- * would put a blocking USB/UART write between the edge and
- * runQueuedCommand(), which is exactly the latency this path exists to
- * avoid. */
+/* Last edge, latched for esyncReport(). Printing from the detector would
+ * put a blocking USB/UART write between the edge and runQueuedCommand(),
+ * which is exactly the latency this whole path exists to avoid. */
 static bool     esync_rep_valid = false;
-static uint32_t esync_rep_t_us = 0;      /* the fire instant */
-static uint32_t esync_rep_sfd_us = 0;    /* t_sfd, the timing reference */
-static uint32_t esync_rep_low_us = 0;    /* SFD blank length */
+static uint32_t esync_rep_t_us = 0;
+static uint32_t esync_rep_fire_us = 0;
+static uint32_t esync_rep_low_us = 0;
 static uint16_t esync_rep_min = 0;
 static uint16_t esync_rep_base = 0;
-static uint8_t  esync_rep_id = 0;
 
 void esyncListen(void)
 {
@@ -69,10 +71,7 @@ void esyncListen(void)
      * to hand back a stale edge or a stale reply. */
     esyncClearReport();
     clearQueuedReply();
-    esync_rej_sfd = 0;
-    esync_rej_chip = 0;
-    esync_rej_id = 0;
-    esync_rej_late = 0;
+    esync_rej_short = 0;
     listen_for_esync = true;
 }
 
@@ -86,30 +85,45 @@ void esyncReport(Print &out)
     if (!esync_rep_valid) {
         /* Nothing has fired. Report what the detector is actually doing so
          * a silent run can be told apart from a stuck one: not primed means
-         * the warmup window has not filled, state names how far into a
-         * packet it got, and the reject tallies say what it kept throwing
-         * away. */
+         * the warmup window has not filled, in_blank means it is inside a
+         * blank, armed means a falling edge is latched and the fire is
+         * already committed, and min_mv against base_mv says whether the
+         * signal is reaching the floor at all. */
         int32_t base = esync_base_acc >> ESYNC_BASELINE_SHIFT;
         out.printf("{\"info\":\"esync\",\"pending\":0,\"listening\":%d,"
-                   "\"primed\":%d,\"state\":%d,\"samples\":%lu,"
-                   "\"base_mv\":%.3f,\"rej_sfd\":%u,\"rej_chip\":%u,"
-                   "\"rej_id\":%u,\"rej_late\":%u}\n",
+                   "\"primed\":%d,\"in_blank\":%d,\"armed\":%d,\"samples\":%lu,"
+                   "\"base_mv\":%.3f,\"min_mv\":%.3f,"
+                   "\"rej_short\":%u}\n",
                    listen_for_esync ? 1 : 0,
                    esync_primed ? 1 : 0,
-                   (int)esync_state,
+                   esync_high ? 0 : 1,
+                   esync_fire_armed ? 1 : 0,
                    (unsigned long)esync_count,
                    rawToMilliVolts((uint16_t)base),
-                   esync_rej_sfd, esync_rej_chip,
-                   esync_rej_id, esync_rej_late);
+                   rawToMilliVolts(esync_seen_min == 0xFFFF ? 0 : esync_seen_min),
+                   esync_rej_short);
         return;
     }
-    out.printf("{\"info\":\"esync\",\"edge\":\"packet\",\"t_us\":%lu,"
-               "\"t_sfd_us\":%lu,\"low_us\":%lu,\"id\":%u,"
+    /* t_us is the falling edge the timing came off; fire_us is when the
+     * queued command actually ran, and should sit ESYNC_FIRE_DELAY_US past
+     * it. low_us is the blank as measured -- the after-the-fact check on
+     * everything the fall-triggered detector could not check in advance.
+     * It reads 0 when the carrier had not returned by the time we fired,
+     * which is the loud case: the blank was longer than the tag assumed.
+     * "long" folds both overruns into one flag for a host that just wants
+     * to know whether to trust the shot. */
+    bool never_returned = (esync_rep_low_us == 0);
+    bool ran_long = never_returned || (esync_rep_low_us > ESYNC_BLANK_MAX_US);
+    out.printf("{\"info\":\"esync\",\"edge\":\"fall\",\"t_us\":%lu,"
+               "\"fire_us\":%lu,\"delay_us\":%lu,\"low_us\":%lu,"
+               "\"returned\":%d,\"long\":%d,"
                "\"min_mv\":%.3f,\"base_mv\":%.3f}\n",
                (unsigned long)esync_rep_t_us,
-               (unsigned long)esync_rep_sfd_us,
+               (unsigned long)esync_rep_fire_us,
+               (unsigned long)ESYNC_FIRE_DELAY_US,
                (unsigned long)esync_rep_low_us,
-               esync_rep_id,
+               never_returned ? 0 : 1,
+               ran_long ? 1 : 0,
                rawToMilliVolts(esync_rep_min),
                rawToMilliVolts(esync_rep_base));
 }
@@ -132,21 +146,21 @@ void esyncReset(void)
     esync_sum = 0;
     esync_drop_thr = milliVoltsToRaw(ESYNC_MIN_BASELINE_MV);
     esync_primed = false;
+    esync_high = true;
     esync_base_acc = 0;
-    esync_state = PKT_IDLE;
+    esync_fire_armed = false;
+    esync_fire_at_us = 0;
     esync_low_enter_us = 0;
     esync_low_min = 0;
-    esync_sfd_len_us = 0;
-    esync_t_sfd_us = 0;
-    memset(esync_chip_sum, 0, sizeof(esync_chip_sum));
-    memset(esync_chip_n, 0, sizeof(esync_chip_n));
+    esync_low_us = 0;
+    esync_seen_min = 0xFFFF;
 }
 
 void esyncSample(void)
 {
     uint16_t s = readAdcRaw();
     /* Timestamped at the read, not where it is looked at, so the gap
-     * between the two never lands in a chip boundary or an edge time. */
+     * between the two never lands in the measured blank length. */
     esync_sample_us = micros();
 
     if (esync_count == ESYNC_BUF_LEN) {
@@ -161,52 +175,45 @@ void esyncSample(void)
 }
 
 /*
- * Slice the binned chips and decode. Fails on a chip the sample loop
- * stalled through, and on any bit whose two halves came out the same --
- * that is not a Manchester transition, so whatever produced it was not
- * our exciter.
- */
-static bool esyncDecode(uint32_t rearm_thr, uint8_t *id_out)
-{
-    uint8_t level[ESYNC_PKT_CHIPS];
-
-    for (int i = 0; i < ESYNC_PKT_CHIPS; i++) {
-        if (esync_chip_n[i] < ESYNC_CHIP_MIN_SAMPLES) {
-            return false;
-        }
-        uint32_t mean = esync_chip_sum[i] / esync_chip_n[i];
-        level[i] = (mean >= rearm_thr) ? 1 : 0;
-    }
-
-    uint8_t id = 0;
-    for (int k = 0; k < ESYNC_PKT_BITS; k++) {
-        uint8_t first  = level[2 * k];
-        uint8_t second = level[2 * k + 1];
-        if (first == second) {
-            return false;
-        }
-        /* IEEE 802.3: low-then-high is a 1. MSB first, matching the
-         * exciter's manchester_chips(). */
-        id = (uint8_t)((id << 1) | second);
-    }
-
-    *id_out = id;
-    return true;
-}
-
-/*
- * Packet detector, driven one sample per loop() pass.
+ * Blank detector, driven one sample per loop() pass.
  *
  * The idle level is tracked with a leaky integrator that is frozen while
- * the signal is down or a packet is in flight, so it settles on the
- * carrier level no matter how often packets come or how long the SFD
- * lasts.
+ * the signal is down, so it settles on the baseline no matter how often
+ * the blanks come or how long they last.
  *
- * Falling into a blank is an absolute test: the signal has to reach the
- * floor, ESYNC_MIN_BASELINE_MV or below. Coming back out is judged at
- * ESYNC_REARM_PCT below the tracked baseline, so the return is measured
- * against the current idle level rather than a fixed number. The gap
- * between the two thresholds is the hysteresis.
+ * Timing comes off the FALLING edge, taken as the first sample at or
+ * under ESYNC_MIN_BASELINE_MV. That one absolute test is both the timing
+ * reference and the proof the blank is real: the exciter drives the
+ * carrier to the floor, so a sag that never gets there never latches an
+ * edge, and no separate depth check is needed.
+ *
+ * An absolute floor rather than a fraction of baseline costs almost
+ * nothing here. Tags receiving different amplitudes cross a fixed low
+ * threshold at slightly different points down the fall, but with the
+ * threshold this close to zero the spread is a fraction of a percent of
+ * the fall time -- well under a microsecond, against a sample period of
+ * tens. A proportional threshold would zero that term and buy nothing
+ * measurable, while making the reference depend on the tracked baseline
+ * being right.
+ *
+ * The queued command then runs ESYNC_FIRE_DELAY_US after that edge, by
+ * dead reckoning, which lands where the carrier is due back.
+ *
+ * The order of business inside a blank is what makes this safe. The fire
+ * deadline is checked before anything else, so nothing -- not a
+ * threshold recomputation, not a baseline collapse -- can sit between the
+ * deadline and the dispatch. The one thing that can still call the fire
+ * off is decided strictly earlier than that deadline: the early-return
+ * test at ESYNC_BLANK_MIN_US, where a blank that is already over was a
+ * fade, and the carrier coming back is proof of it while there is still
+ * time to act on the proof.
+ *
+ * What cannot be checked is the other end. The tag is committed from the
+ * falling edge, so a blank that overruns -- an outage, a scale mismatch
+ * -- is fired against regardless and only shows up afterwards, in the
+ * measured low_us that esyncReport() hands back. That is the price of
+ * timing off the fall, and it is why low_us is worth reading on any run
+ * whose results look off.
  */
 void esyncListening(void)
 {
@@ -218,7 +225,8 @@ void esyncListening(void)
     uint32_t now_us = esync_sample_us;
 
     /* Seed the baseline from the warmup window, then adopt the current
-     * level without calling it an edge. */
+     * level without calling it an edge. Priming never arms a fire: the
+     * transition into a known state is not a falling edge. */
     if (!esync_primed) {
         if (esync_count < ESYNC_WARMUP_SAMPLES) {
             return;
@@ -226,12 +234,38 @@ void esyncListening(void)
         int32_t seed = (int32_t)(esync_sum / esync_count);
         esync_base_acc = seed << ESYNC_BASELINE_SHIFT;
         esync_primed = true;
-        esync_state = PKT_IDLE;
+        esync_high = (newest > esync_drop_thr);
+        esync_fire_armed = false;
         return;
     }
 
-    int32_t  baseline  = esync_base_acc >> ESYNC_BASELINE_SHIFT;
-    uint32_t drop_thr  = esync_drop_thr;
+    /* The committed fire, ahead of every other consideration. Signed
+     * difference so a micros() wrap inside the delay window still
+     * compares correctly. */
+    if (esync_fire_armed && (int32_t)(now_us - esync_fire_at_us) >= 0) {
+        esync_rep_t_us    = esync_low_enter_us;
+        esync_rep_fire_us = now_us;
+        esync_rep_low_us  = esync_low_us;
+        esync_rep_min     = esync_low_min;
+        esync_rep_base    = (uint16_t)(esync_base_acc >> ESYNC_BASELINE_SHIFT);
+        esync_rep_valid   = true;
+
+        /* One shot: disarm before dispatching, so a queued esync can re-arm
+         * us cleanly instead of being undone by the stop. */
+        esyncStop();
+        runQueuedCommand();
+        return;
+    }
+
+    if (newest < esync_seen_min) {
+        esync_seen_min = newest;
+    }
+
+    int32_t  baseline = esync_base_acc >> ESYNC_BASELINE_SHIFT;
+    uint32_t drop_thr = esync_drop_thr;
+    /* Only the RETURN is judged against the baseline. It is not a timing
+     * reference -- it just has to mean "clearly back up", far enough above
+     * the floor to be hysteresis rather than chatter. */
     uint32_t rearm_thr = (uint32_t)baseline * (100 - ESYNC_REARM_PCT) / 100;
 
     if (rearm_thr <= drop_thr) {
@@ -239,108 +273,56 @@ void esyncListening(void)
          * and the state machine would rattle between them. Keep letting
          * the baseline climb so we recover if the signal comes back. */
         esync_base_acc += (int32_t)newest - baseline;
-        esync_state = PKT_IDLE;
         return;
     }
 
-    switch (esync_state) {
-    case PKT_IDLE:
+    if (esync_high) {
         if (newest <= drop_thr) {
-            esync_state = PKT_SFD;
+            /* Falling edge: at the floor, so this is a blank and not a
+             * sag. This instant is the whole timing reference, so the
+             * deadline is set from it here and never revised. */
+            esync_high = false;
             esync_low_enter_us = now_us;
             esync_low_min = newest;
+            esync_low_us = 0;
+            esync_fire_at_us = now_us + ESYNC_FIRE_DELAY_US;
+            esync_fire_armed = true;
         } else if (newest >= rearm_thr) {
             /* Clearly at rest: the only place the baseline moves. Samples
              * mid-transition are skipped so an edge cannot pull it down. */
             esync_base_acc += (int32_t)newest - baseline;
         }
-        break;
-
-    case PKT_SFD:
-        if (newest < esync_low_min) {
-            esync_low_min = newest;
-        }
-        if (newest >= rearm_thr) {
-            uint32_t low_us = now_us - esync_low_enter_us;
-            if (low_us >= ESYNC_SFD_MIN_US && low_us <= ESYNC_SFD_MAX_US) {
-                /* This crossing is t_sfd: everything downstream is timed
-                 * from here, including the fire instant. */
-                esync_t_sfd_us = now_us;
-                esync_sfd_len_us = low_us;
-                memset(esync_chip_sum, 0, sizeof(esync_chip_sum));
-                memset(esync_chip_n, 0, sizeof(esync_chip_n));
-                esync_state = PKT_PAYLOAD;
-            } else {
-                esync_rej_sfd++;
-                esync_state = PKT_IDLE;
-            }
-        }
-        break;
-
-    case PKT_PAYLOAD: {
-        uint32_t elapsed = now_us - esync_t_sfd_us;
-
-        if (elapsed < ESYNC_GUARD_US) {
-            break;              /* still in the guard, nothing to bin */
-        }
-
-        if (elapsed < ESYNC_PAYLOAD_END_US) {
-            uint32_t into  = elapsed - ESYNC_GUARD_US;
-            uint32_t chip  = into / ESYNC_CHIP_US;
-            uint32_t phase = into - chip * ESYNC_CHIP_US;
-
-            /* Middle half only. The outer quarters are ramp and whatever
-             * the loop period smeared across the boundary. */
-            if (phase >= ESYNC_CHIP_US / 4 &&
-                phase < (3 * ESYNC_CHIP_US) / 4) {
-                esync_chip_sum[chip] += newest;
-                esync_chip_n[chip]++;
-            }
-            break;
-        }
-
-        /* Payload window is over. */
-        uint8_t id = 0;
-        if (!esyncDecode(rearm_thr, &id)) {
-            esync_rej_chip++;
-            esync_state = PKT_IDLE;
-            break;
-        }
-        if (ESYNC_PKT_REQUIRE_ID >= 0 && id != (uint8_t)ESYNC_PKT_REQUIRE_ID) {
-            esync_rej_id++;
-            esync_state = PKT_IDLE;
-            break;
-        }
-        if (micros() - esync_t_sfd_us > ESYNC_FIRE_OFFSET_US) {
-            /* Decode ran past the instant every other tag is firing at.
-             * Firing now would put this tag's command somewhere no one
-             * else is, so drop the packet and wait for the next one. */
-            esync_rej_late++;
-            esync_state = PKT_IDLE;
-            break;
-        }
-
-        /* Spin out the remaining slack. The wait is what makes the fire
-         * instant identical across tags: it is a fixed offset from an
-         * edge they all saw, rather than whenever each one's decode
-         * happened to finish. */
-        while (micros() - esync_t_sfd_us < ESYNC_FIRE_OFFSET_US) {
-            /* nothing */
-        }
-
-        esync_rep_t_us   = micros();
-        esync_rep_sfd_us = esync_t_sfd_us;
-        esync_rep_low_us = esync_sfd_len_us;
-        esync_rep_min    = esync_low_min;
-        esync_rep_base   = (uint16_t)baseline;
-        esync_rep_id     = id;
-        esync_rep_valid  = true;
-
-        /* One shot: disarm before dispatching, so a queued esync can
-         * re-arm us cleanly instead of being undone by the stop. */
-        esyncStop();
-        runQueuedCommand();
-        break;
+        return;
     }
+
+    if (newest < esync_low_min) {
+        esync_low_min = newest;
+    }
+
+    if (!esync_fire_armed) {
+        /* Down, but with no fire pending: primed into a dark band, or a
+         * blank already thrown out. Wait for a settled return before
+         * calling the signal high again -- going high while still under
+         * the threshold would re-trigger on the tail of the same blank. */
+        if (newest >= rearm_thr) {
+            esync_high = true;
+        }
+        return;
+    }
+
+    if (esync_low_us == 0 && newest >= rearm_thr) {
+        /* The carrier is back, and early enough that we still have the
+         * choice. Under ESYNC_BLANK_MIN_US this was a fade: throw the fire
+         * away. Otherwise record the length and let the deadline stand --
+         * a blank that ends slightly early still fires where the exciter
+         * meant it to. */
+        uint32_t low_us = now_us - esync_low_enter_us;
+        if (low_us < ESYNC_BLANK_MIN_US) {
+            esync_rej_short++;
+            esync_fire_armed = false;
+            esync_high = true;
+            return;
+        }
+        esync_low_us = low_us;
     }
 }

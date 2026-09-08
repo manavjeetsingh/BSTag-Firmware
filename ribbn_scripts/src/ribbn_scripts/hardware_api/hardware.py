@@ -169,9 +169,18 @@ class Tag:
 
     def esync_report_wifi(self, timeout=WIFI_TIMEOUT):
         """
-            The edge that fired the queued command: t_us, low_us, and the
-            min/baseline levels it was judged against. Useful for checking
-            threshold margin and for comparing low_us across tags.
+            The edge that fired the queued command: t_us (the falling edge
+            it timed off), fire_us (when the command actually ran), low_us
+            (the blank as measured), and the min/baseline levels it was
+            judged against.
+
+            The tag commits at the falling edge and fires delay_us later
+            without waiting to see the blank end, so low_us is an
+            after-the-fact check rather than something the tag acted on:
+            it should read back as the exciter's DROP_MS. "returned":0
+            means the carrier had not come back by the time it fired.
+            Useful for checking threshold margin and for comparing low_us
+            across tags.
         """
         discard_read = self._wifi_readline()
         self._wifi_write(bytes("esyncr\r\n", "UTF8"))
