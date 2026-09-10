@@ -1,6 +1,5 @@
 #include "commands.h"
 
-#include <WiFi.h>
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,6 +11,12 @@
 #include "hardware.h"
 #include "net.h"
 #include "session.h"
+
+#if NET_ENABLED
+#include <WiFi.h>
+#else
+#include <esp_mac.h>   /* esp_read_mac() -- efuse MAC, no WiFi driver needed */
+#endif
 
 /* Deferred command slot. */
 static char queued_cmd[CMD_BUF_LEN] = {0};
@@ -197,7 +202,17 @@ void handleCommand(char *command, Print &out, int session_idx, bool from_queue)
         return;
     }
     if (strcmp(command, "mac") == 0) {
+#if NET_ENABLED
         out.printf("{\"mac\":\"%s\"}\n", WiFi.macAddress().c_str());
+#else
+        /* Same value WiFi.macAddress() would give (it falls back to this
+         * exact call when the WiFi driver has never been started), read
+         * straight from efuse without pulling in the WiFi stack. */
+        uint8_t mac[6];
+        esp_read_mac(mac, ESP_MAC_WIFI_STA);
+        out.printf("{\"mac\":\"%02X:%02X:%02X:%02X:%02X:%02X\"}\n",
+                   mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#endif
         return;
     }
     if (strcmp(command, "wifi_off") == 0) {

@@ -220,18 +220,8 @@ class Tag:
         """
         discard_read=self.ser.readline()
         self.ser.write(bytes("esync"+"\r\n", "UTF8"))
-        c_str=bytes("esync:listening\r\n",'UTF8')
-        ts = time.time()
-        while True:
-            line = self.ser.readline()
-            # print(line)
-            if len(line) > 0:
-                print(line,'\t',c_str)
-                assert (line == c_str)
-                return
-
-            if time.time() - ts > 5:
-                raise Exception('no valid answer timeout')
+        c_str="esync:listening\r\n"
+        self._read_until_contains(self.ser.readline, c_str, 5, 'no valid answer timeout')
 
     def listen_esync_wifi(self, timeout=WIFI_TIMEOUT):
         """
@@ -239,38 +229,19 @@ class Tag:
         """
         discard_read=self._wifi_readline()
         self._wifi_write(bytes("esync"+"\r\n", "UTF8"))
-        c_str=bytes("esync:listening\r\n",'UTF8')
-        ts = time.time()
-        while True:
-            line = self._wifi_readline()
-            if len(line) > 0:
-                print(line,'\t',c_str)
-                assert (line == c_str)
-                return
-
-            if time.time() - ts > timeout:
-                raise Exception('no valid answer timeout')
+        c_str="esync:listening\r\n"
+        self._read_until_contains(self._wifi_readline, c_str, timeout, 'no valid answer timeout')
 
     def queue_any(self, command_str):
         discard_read=self.ser.readline()
         
         q_command="q_"+command_str
-        c_str=bytes(f"q:queued, {command_str}\n",'UTF8')
+        c_str=f"q:queued, {command_str}\n"
         self.ser.write(bytes(q_command+"\r\n", "UTF8"))
-        
-        ts = time.time()
-        while True:
-            line = self.ser.readline()
-            # print(line)
-            if len(line) > 0:
-                print(line,'\t',c_str)
-                assert (line == c_str)
-                return
 
-            if time.time() - ts > 5:
-                raise Exception('no valid answer timeout')
-        
-    
+        self._read_until_contains(self.ser.readline, c_str, 5, 'no valid answer timeout')
+
+
     def queue_any_wifi(self, command_str, timeout=WIFI_TIMEOUT):
         """
             WiFi counterpart to queue_any().
@@ -278,19 +249,10 @@ class Tag:
         discard_read=self._wifi_readline()
 
         q_command="q_"+command_str
-        c_str=bytes(f"q:queued, {command_str}\n",'UTF8')
+        c_str=f"q:queued, {command_str}\n"
         self._wifi_write(bytes(q_command+"\r\n", "UTF8"))
 
-        ts = time.time()
-        while True:
-            line = self._wifi_readline()
-            if len(line) > 0:
-                print(line,'\t',c_str)
-                assert (line == c_str)
-                return
-
-            if time.time() - ts > timeout:
-                raise Exception('no valid answer timeout')
+        self._read_until_contains(self._wifi_readline, c_str, timeout, 'no valid answer timeout')
 
     def queue_adc_read(self, num_samples):
         command=f"adc_{num_samples}"
@@ -337,7 +299,6 @@ class Tag:
     def reflect(self, ch):
         discard_read=self.ser.readline()
         c_str = 'ch: ' + str(ch) + ', ok\r\n'
-        c_str = bytes(c_str, "UTF8")
 
         while True:
             try:
@@ -345,39 +306,21 @@ class Tag:
                 discard_read=self.ser.readline()
                 # print("DR",discard_read)
                 self.ser.write(bytes("ch_"+str(ch)+"\r\n", "UTF8"))
-                ts = time.time()
-                while True:
-                    line = self.ser.readline()
-                    # print(line)
-                    if len(line) > 0:
-                        print(line,'\t',c_str)
-                        assert (line == c_str)
-                        return
-
-                    if time.time() - ts > 5:
-                        raise Exception('no valid answer timeout')
+                self._read_until_contains(self.ser.readline, c_str, 5, 'no valid answer timeout')
+                return
             except Exception as e:
                 # self.disconnect()
                 raise e
 
     def reflect_wifi(self, ch, timeout=WIFI_TIMEOUT):
         c_str = 'ch: ' + str(ch) + ', ok\r\n'
-        c_str = bytes(c_str, "UTF8")
 
         while True:
             try:
                 discard_read = self._wifi_readline()
                 self._wifi_write(bytes("ch_"+str(ch)+"\r\n", "UTF8"))
-                ts = time.time()
-                while True:
-                    line = self._wifi_readline()
-                    if len(line) > 0:
-                        print(line, '\t', c_str)
-                        assert (line == c_str)
-                        return
-
-                    if time.time() - ts > timeout:
-                        raise Exception('no valid answer timeout')
+                self._read_until_contains(self._wifi_readline, c_str, timeout, 'no valid answer timeout')
+                return
             except Exception as e:
                 raise e
 
@@ -388,33 +331,32 @@ class Tag:
         """
         self.ser.write(b"rdb\0\n")
         command_start_time=time.time()
+        prev=''
         while True:
             if time.time()-command_start_time>self.resetTime:
+                print(f"begin_reading timed out after {self.resetTime}s; last received ({len(prev)} chars): {prev[:300]!r}")
                 raise Exception("Stuck in begin_reading")
-            
-            line = self.ser.readline()
-            if len(line) > 0:
-                if "rdb" in str(line):
-                    break
-                else:
-                    print(str(line))
+
+            raw = self.ser.readline()
+            if len(raw) == 0:
+                time.sleep(0.001)
+                continue
+
+            line = prev+raw.decode()
+            if "rdb" in line:
+                prev=''
+                break
+            elif line[-1] != "\n":
+                prev=line
+            else:
+                prev=''
 
     def begin_reading_wifi(self, timeout=WIFI_TIMEOUT):
         """
             WiFi counterpart to begin_reading().
         """
         self._wifi_write(b"rdb\0\n")
-        command_start_time = time.time()
-        while True:
-            if time.time() - command_start_time > timeout:
-                raise Exception("Stuck in begin_reading_wifi")
-
-            line = self._wifi_readline()
-            if len(line) > 0:
-                if "rdb" in str(line):
-                    break
-                else:
-                    print(str(line))
+        self._read_until_contains(self._wifi_readline, "rdb", timeout, "Stuck in begin_reading_wifi")
 
     # def stop_reading(self):
     #     """
@@ -470,10 +412,12 @@ class Tag:
         read_start_time = time.time()
         while True:
             if time.time() - read_start_time > self.resetTime:
+                print(f"stop_reading timed out after {self.resetTime}s; received {len(buffer)} chars so far: {buffer[:300]!r}")
                 raise Exception("Stuck in stop_reading")
 
             line = self.ser.readline()
             if len(line) == 0:
+                time.sleep(0.001)
                 continue
 
             try:
@@ -506,6 +450,7 @@ class Tag:
         read_start_time = time.time()
         while True:
             if time.time() - read_start_time > timeout:
+                print(f"stop_reading_wifi timed out after {timeout}s; received {len(buffer)} chars so far: {buffer[:300]!r}")
                 raise Exception("Stuck in stop_reading_wifi")
 
             line = self._wifi_readline()
@@ -530,6 +475,35 @@ class Tag:
 
             return self.clean_buf_data(payload)
 
+    def _read_until_contains(self, readline, target, timeout, timeout_msg):
+        """
+            Reads lines via `readline` until `target` shows up, keeping a
+            `prev` suffix across reads so a target string split across two
+            reads (e.g. b'{"info":"mp' + b'p","ch":8,...}') is still caught
+            instead of missed by a single readline() check.
+        """
+        start_time = time.time()
+        prev = ''
+        while True:
+            if time.time() - start_time > timeout:
+                print(f"{timeout_msg} after {timeout}s waiting for {target!r}; last received ({len(prev)} chars): {prev[:300]!r}")
+                raise Exception(timeout_msg)
+
+            raw = readline()
+            line = raw.decode(errors='ignore') if isinstance(raw, bytes) else raw
+            if len(line) == 0:
+                time.sleep(0.001)
+                continue
+
+            combined = prev + line
+            if target in combined:
+                return combined
+
+            if combined.endswith('\n'):
+                prev = ''
+            else:
+                prev = combined
+
     def _read_json(self, readline, timeout, what):
         """
             Accumulates bytes from `readline` until a balanced {...} blob can
@@ -541,10 +515,12 @@ class Tag:
         read_start_time = time.time()
         while True:
             if time.time() - read_start_time > timeout:
+                print(f"{what} timed out after {timeout}s; received {len(buffer)} chars so far: {buffer[:300]!r}")
                 raise Exception("Stuck in " + what)
 
             line = readline()
             if len(line) == 0:
+                time.sleep(0.001)
                 continue
 
             buffer += line.decode(errors='ignore')
@@ -613,16 +589,7 @@ class Tag:
         """
         mpp_start_time=time.time()
         self.ser.write(f"mpp_{passes}\0\n".encode())
-        while True:
-            if time.time()-mpp_start_time>self.resetTime:
-                raise Exception("Stuch in perfrom_mpp")
-                
-            line = self.ser.readline()
-            if len(line) > 0:
-                if "mpp" in str(line):
-                    break
-                else:
-                    print(str(line))
+        self._read_until_contains(self.ser.readline, "mpp", self.resetTime, "Stuch in perfrom_mpp")
         mpp_end_time=time.time()
 
         return mpp_start_time, mpp_end_time
@@ -633,16 +600,7 @@ class Tag:
         """
         mpp_start_time = time.time()
         self._wifi_write(f"mpp_{passes}\0\n".encode())
-        while True:
-            if time.time() - mpp_start_time > timeout:
-                raise Exception("Stuch in perfrom_mpp_wifi")
-
-            line = self._wifi_readline()
-            if len(line) > 0:
-                if "mpp" in str(line):
-                    break
-                else:
-                    print(str(line))
+        self._read_until_contains(self._wifi_readline, "mpp", timeout, "Stuch in perfrom_mpp_wifi")
         mpp_end_time = time.time()
 
         return mpp_start_time, mpp_end_time

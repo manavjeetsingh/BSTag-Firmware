@@ -3,7 +3,8 @@
 
 #include <Arduino.h>
 
-/* Bring up STA mode, or stay off when WIFI_SSID is empty. */
+/* Bring up STA mode, or stay off when WIFI_SSID is empty. A no-op stub
+ * when NET_ENABLED (config.h) is 0 -- WiFi/TCP is not compiled in at all. */
 void wifiStart(void);
 
 /* Track link state and retry; call from loop(). */

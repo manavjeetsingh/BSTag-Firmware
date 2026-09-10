@@ -18,7 +18,7 @@ Active development is in `XIAO-ESP32-C6_firmware_wifi/` (see `git status` — th
 
 There is no unified build system — each part has its own toolchain and there is no CI in this repo.
 
-**Tag firmware** (`XIAO-ESP32-C6_firmware_wifi/XIAO-ESP32-C6_firmware_wifi.ino`): built and flashed via the Arduino IDE/CLI targeting the "XIAO_ESP32C6" board. `XIAO-ESP32-C6_firmware_wifi/secrets.h` is gitignored and has no checked-in template — create it locally with `#define WIFI_SSID` and `#define WIFI_PASS` before compiling, or the sketch won't build. Leaving `WIFI_SSID` empty disables WiFi at compile time and the tag runs Serial-only.
+**Tag firmware** (`XIAO-ESP32-C6_firmware_wifi/XIAO-ESP32-C6_firmware_wifi.ino`): built and flashed via the Arduino IDE/CLI targeting the "XIAO_ESP32C6" board. `XIAO-ESP32-C6_firmware_wifi/secrets.h` is gitignored and has no checked-in template — create it locally with `#define WIFI_SSID` and `#define WIFI_PASS` before compiling, or the sketch won't build (unless `NET_ENABLED` is 0, see below). Leaving `WIFI_SSID` empty is a runtime switch: WiFi/TCP is still compiled in, but `wifiStart()` never brings the radio up and the tag runs Serial-only. `NET_ENABLED` in `config.h` is the compile-time switch — set it to 0 to strip net.cpp's WiFi.h use and the TCP session slots out of the build entirely (smaller flash/RAM, and `secrets.h` is not needed to compile); the `mac` command still works, reading efuse directly instead of going through the WiFi driver.
 - `arduino-cli compile --fqbn esp32:esp32:XIAO_ESP32C6 XIAO-ESP32-C6_firmware_wifi`
 - `arduino-cli upload -p <port> --fqbn esp32:esp32:XIAO_ESP32C6 XIAO-ESP32-C6_firmware_wifi`
 
@@ -63,8 +63,8 @@ Because the radio is down when it fires, the reply is captured to RAM instead of
 
 The header comment at the top of the `.ino` is the map; module boundaries matter — keep new code in the module it belongs to rather than adding to the `.ino`:
 
-- `config.h` — pin map and every tuning constant (buffer sizes, timeouts, dwell times). Change behavior here first before hardcoding a new constant elsewhere.
-- `secrets.h` — WiFi credentials, gitignored, must be created locally
+- `config.h` — pin map and every tuning constant (buffer sizes, timeouts, dwell times), plus `NET_ENABLED` (compile WiFi/TCP in at all). Change behavior here first before hardcoding a new constant elsewhere.
+- `secrets.h` — WiFi credentials, gitignored, must be created locally unless `NET_ENABLED` is 0
 - `hardware.*` — power rail, LEDs, RF switch, ADC-over-SPI
 - `acquisition.*` — buffered capture, plotter stream, MPP sweep; owns `pathIsBusy()`, the guard against overlapping RF-path users
 - `esync.*` — exciter sync listener and edge detector

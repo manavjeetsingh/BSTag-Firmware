@@ -1,7 +1,19 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+/* Compile WiFi/TCP support in at all. 0 strips net.cpp's WiFi.h use and
+ * the TCP session slots out of the build -- smaller flash/RAM, and
+ * secrets.h is not needed to compile. The "mac" command still works: it
+ * reads efuse directly instead of going through the WiFi driver.
+ *
+ * This is independent of (and stronger than) the runtime switch: with
+ * this at 1, an empty WIFI_SSID in secrets.h still disables the radio at
+ * runtime (see wifiStart()) but the WiFi/TCP code is still linked in. */
+#define NET_ENABLED             0
+
+#if NET_ENABLED
 #include "secrets.h"
+#endif
 
 #define TCP_PORT               3333
 #define MAX_TCP_CLIENTS        2
@@ -178,10 +190,14 @@
 /* MPP sweep. */
 /* Per-channel dwell. The esync-fired sweep gets its own value so the
  * synchronised run can dwell differently from an interactive probe. */
-#define MPP_DWELL_US           1000   /* interactive mpp/mpp_<n> */
+#define MPP_DWELL_US           3000   /* interactive mpp/mpp_<n> */
 #define MPP_DWELL_QUEUED_US    3000   /* mpp fired by the esync detector */
 #define MPP_MAX_PASSES         1000
 
+#if NET_ENABLED
 #define SESSION_COUNT          (1 + MAX_TCP_CLIENTS)   /* slot 0 is Serial */
+#else
+#define SESSION_COUNT          1                       /* Serial only */
+#endif
 
 #endif /* CONFIG_H */

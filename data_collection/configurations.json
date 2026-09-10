@@ -1,0 +1,13 @@
+{
+    "EXCITER": "rf_gen",
+    "MPP_REPETITIONS": 1,
+    "FREQ_MIN": 915, 
+    "FREQ_MAX": 915,
+    "FREQ_JUMP": 10,
+    "SAVE_DIR": "/Users/manavjeet/git/BSTag-Firmware/data_collection/out",
+    "INTER_MPP_BATCH_SLEEP_S": 0.1,
+    "NUM_EXP_RUNS": 100,
+    "EXP_NAME": "mpp_testing_multifeq",
+    "CHANNELS": [1,3,4,6,7,8],
+    "HW_CONFIG_PATH": "/Users/manavjeet/git/BSTag-Firmware/data_collection/hw_config/old_config.cal"
+}

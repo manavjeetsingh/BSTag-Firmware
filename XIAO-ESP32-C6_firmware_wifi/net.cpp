@@ -1,9 +1,12 @@
 #include "net.h"
 
+#include "config.h"
+
+#if NET_ENABLED
+
 #include <WiFi.h>
 #include <string.h>
 
-#include "config.h"
 #include "session.h"
 
 static WiFiServer tcp_server(TCP_PORT);
@@ -165,3 +168,33 @@ void printNetStatus(Print &out)
                (unsigned)TCP_PORT,
                (int)WiFi.RSSI());
 }
+
+#else /* !NET_ENABLED */
+
+/* WiFi/TCP compiled out. Every entry point below stays, as a no-op or a
+ * fixed status, so callers in the .ino and commands.cpp need no #ifdef of
+ * their own -- in particular esync's wifiSuspend()/wifiResume() calls and
+ * loop()'s wifiSuspended() poll are unconditional. */
+
+void wifiStart(void)
+{
+    Serial.println("wifi:disabled, not compiled in");
+}
+
+void wifiSuspend(void) {}
+void wifiResume(void) {}
+
+bool wifiSuspended(void)
+{
+    return false;
+}
+
+void serviceWifi(void) {}
+void serviceTcp(void) {}
+
+void printNetStatus(Print &out)
+{
+    out.println("{\"net\":\"disabled\"}");
+}
+
+#endif /* NET_ENABLED */
