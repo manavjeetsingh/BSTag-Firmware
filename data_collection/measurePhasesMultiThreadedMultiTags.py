@@ -248,6 +248,7 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
             open(csv_path, "w").close()
             print(f"Cleared existing file: {csv_path}")
 
+    t_start=time.time()
     for run_exp_num in range(num_exp_runs):
         print(f"MPP Batch {run_exp_num}/{num_exp_runs}")
     
@@ -255,7 +256,6 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
             exc.set_pwr(EXC_POWER)
 
         
-        t_start=time.time()
         premature_stop=0
         premature_stop_error=""
         FREQS_DONE=[]
@@ -343,7 +343,7 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
 
     time_taken=time.time()-t_start
 
-    print(f"Time taken: {time_taken}")
+    print(f"Time taken: {time_taken} for {num_exp_runs} runs over {len(freq_range)} freqs")
     
     if exciter_type=="rf_gen":
         exc.set_pwr(-30)
@@ -353,11 +353,11 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
 
 
 
-def test(tags, use_exciter=False):
+def test(tags, exciter_type):
     global cmd_qs, processes, result_q
     
-    if use_exciter:
-        global exc
+    if exciter_type=='rf_gen':
+        exc = Exciter()
         exc.set_pwr(EXC_POWER)
         exc.set_freq(915)
     
@@ -414,6 +414,9 @@ def test(tags, use_exciter=False):
         if res_type == 'adc_vals':
             print(f"✅ ADC val received for tag {tag_id} is {np.median(data)}")
             adc_results[tag_id] = data
+
+    if exciter_type=='rf_gen':
+        exc.set_pwr(-30)
     
     return {"Test": "done"}
 

@@ -7,6 +7,7 @@ import pickle
 def tag_detection():
     mac_tag_mapping = get_exising_mapping("mac-tag-mapping.json")
     ports = get_ports()
+    print(ports)
     tag_port_mapping=dict()
     
     for p in ports:
@@ -37,7 +38,7 @@ def main():
     
     tag_port_mapping=tag_detection()
     mtt.initialize(tag_port_mapping)
-    mtt.test(tag_port_mapping.keys())
+    mtt.test(tag_port_mapping.keys(), exciter_type=configurations["EXCITER"])
     
     if len(tag_port_mapping)<2:
         raise Exception(f"Need at least two tags, got {len(tag_port_mapping)}")
@@ -51,7 +52,8 @@ def main():
     err=mtt.mainMultiWays(
         num_exp_runs=configurations["NUM_EXP_RUNS"],
         hw_config=hw_config,
-        save_path="/Users/manavjeet/git/BSTag-Firmware/data_collection/out",exp_name=configurations["EXP_NAME"],
+        save_path=configurations['SAVE_DIR'],
+        exp_name=configurations["EXP_NAME"],
         freq_range=np.arange(
             configurations["FREQ_MIN"],
             configurations["FREQ_MAX"]+1,

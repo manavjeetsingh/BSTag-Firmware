@@ -43,10 +43,8 @@ def get_ports():
         ports_desc_hwid = comports()
         ports=[]
         for p,d,h in ports_desc_hwid:
-            ports.append(p)
-            
-
-        raise NotImplementedError("Implement win ports")
+            if "USB Serial Device" in d:
+                ports.append(p)
     
     return ports
 
