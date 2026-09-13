@@ -679,10 +679,10 @@ class VNA:
         rm = pyvisa.ResourceManager()
         self.inst = rm.open_resource('GPIB0::17::INSTR')
         self.inst.write(':SENS1:FREQ:STAR 700E6')
-        self.inst.write(':SENS1:FREQ:STOP 1000E6')
+        self.inst.write(':SENS1:FREQ:STOP 3000E6')
         self.inst.write(':SOUR1:POW -30')
         self.inst.write(':SENS1:SWE:DEL 0.001')
-        self.inst.write(':SENS1:SWE:POIN 200')
+        self.inst.write(':SENS1:SWE:POIN 1000')
         self.inst.write(':CALC1:PAR1:DEF S11')
         # self.inst.write(':MMEM:STOR:FDAT "D:/automated_folder/Trace01.csv"')
 
