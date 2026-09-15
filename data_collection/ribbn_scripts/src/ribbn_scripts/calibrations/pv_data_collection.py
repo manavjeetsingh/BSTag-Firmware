@@ -8,21 +8,27 @@ exc = Exciter()
 exc.set_freq(915)
 exc.set_pwr(-30)
 
-fn = 'v32-3'
-tag = Tag("COM6")
-tag.reflect(b'ch_2\0\n')
+save_folder='PV_data_Sept2026'
+
+
+tag = Tag("COM31")
+fn=tag.get_mac().replace(":",'_')
+tag.reflect(2)
 
 pwr_range = range(-35, -13, 1)
-tim_delay = 0.5
+tim_delay = 0.1
 col_data = {}
 
-for freq in range(775,1010,10):
+for freq in range(700,1010,10):
     exc.set_freq(freq)
     one_freq_data = []
 
     for pwr in pwr_range:
         exc.set_pwr(pwr)
         time.sleep(tim_delay)
+        if pwr==-35:
+            print("extra_sleep")
+            time.sleep(0.5)
         v = np.median(tag.get_adc_val())
         one_freq_data.append(v)
         print(v)
@@ -32,6 +38,6 @@ for freq in range(775,1010,10):
 
 # write_pickle('D:/git/T2TExperiments/coba/calibrations/PV_data_Aug2024/'+fn+'_pv_dat.pkl', col_data)
 # write_pickle('C:/git/T2TExperiments/coba/calibrations/PV_data_Aug2024/'+fn+'_pv_dat.pkl', col_data)
-write_pickle('C:/git/T2TExperiments/coba/calibrations/PV_data_Dec2025/'+fn+'_pv_dat.pkl', col_data)
-plt.plot(pwr_range, col_data[915], 'o')
+write_pickle(save_folder+'/'+fn+'_pv_dat.pkl', col_data)
+# plt.plot(pwr_range, col_data[915], 'o')
 plt.show()
