@@ -1,21 +1,19 @@
 import numpy as np
 import math
 
-def cal_theta(adcs, rxName, txName, cfg):
+def cal_theta(adcs, rxName, txName, cfg, freq):
+    """freq in hz"""
     amp = []
     phi = []
     attn = []
     for channel in adcs.keys():
-        dbm = np.polyval(cfg['pv'][rxName], np.log(adcs[channel]))
+        dbm = np.polyval(cfg['pv'][rxName][freq], np.log(adcs[channel]))
         uW = np.power(10, (dbm - 30) / 10) * 1e6
         amp.append(np.sqrt(uW * 50 * 2))
-        pwr = int(round(dbm, 0))
-        if pwr < -30:
-            pwr = -30
-        elif pwr > -12:
-            pwr = -12
-        phi.append(np.polyval(cfg['s11'][txName][f'{channel};{pwr}'][0], 915))
-        attn.append(np.polyval(cfg['s11'][txName][f'{channel};{pwr}'][1], 915))
+        # pwr = int(round(dbm, 0))
+        
+        phi.append(np.polyval(cfg['s11'][txName][f'{channel}']['phase'], freq))
+        attn.append(np.polyval(cfg['s11'][txName][f'{channel}']['amp'], freq))
 
     h = []
     for a, p in zip(attn, phi):

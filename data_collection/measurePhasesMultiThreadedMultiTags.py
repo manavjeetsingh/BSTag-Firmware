@@ -165,20 +165,6 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
     return voltage_readings, mpp_start_time, mpp_stop_time
 
 
-def getExperimentNo():
-    all_files=os.listdir(f"{FOLDER_PATH}/dataframes/")
-    if len(all_files)==0:
-        return 0
-    else:
-        to_ret=0
-        while True:
-            if f"{to_ret}.df" in all_files:
-                to_ret+=1
-            else:
-                break
-        return to_ret
-
-
 def getChannelVoltage(voltage_readings, mpp_stop_time, mpp_start_time, channels,plotting=False):
     channel_medians={}
     channel_voltages={}
@@ -230,6 +216,7 @@ def getChannelVoltage(voltage_readings, mpp_stop_time, mpp_start_time, channels,
 
 def mainMultiWays(num_exp_runs, exp_name, save_path, 
                   hw_config,
+                  tag_mac_mapping,
                   freq_range=FREQ_RANGE,     
                   exciter_type=None, mpp_repetitions=1, 
                   inter_MPP_batch_sleep_time=0.1,
@@ -295,8 +282,10 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                             
                             # MPP processing and phase calculation
                             channel_median, channels_voltages=getChannelVoltage(_voltages, mpp_stop_time_1, mpp_start_time_1, channels=channels, plotting=False)
-                            phase_theta=cal_theta(channel_median, rxName='TagV32_3', txName='TagV32_2',
-                                                  cfg=hw_config)
+                            phase_theta=cal_theta(channel_median, rxName=tag_mac_mapping[rx_tag], txName=tag_mac_mapping[rx_tag],
+                            cfg=hw_config,
+                            freq=freq*1e6, #in hz
+                            )
                             
                             print(phase_theta)
                             
