@@ -7,14 +7,16 @@ def cal_theta(adcs, rxName, txName, cfg, freq):
     phi = []
     attn = []
     for channel in adcs.keys():
-        print(rxName, freq, cfg.keys())
-        dbm = np.polyval(cfg['pv'][rxName][freq], np.log(adcs[channel]))
+        dbm = np.polyval(cfg['pv'][rxName][freq]['polynomial'], np.log(adcs[channel]))
         uW = np.power(10, (dbm - 30) / 10) * 1e6
         amp.append(np.sqrt(uW * 50 * 2))
         # pwr = int(round(dbm, 0))
         
-        phi.append(np.polyval(cfg['s11'][txName][f'{channel}']['phase'], freq))
-        attn.append(np.polyval(cfg['s11'][txName][f'{channel}']['amp'], freq))
+        # despite the _s11_poly file name, these hold the raw VNA sweep
+        # (freq axis + per-point values), not polynomial coefficients
+        s11 = cfg['s11'][txName][channel]
+        phi.append(np.interp(freq, s11['freq'], np.unwrap(s11['phase'])))
+        attn.append(np.interp(freq, s11['freq'], s11['amp']))
 
     h = []
     for a, p in zip(attn, phi):

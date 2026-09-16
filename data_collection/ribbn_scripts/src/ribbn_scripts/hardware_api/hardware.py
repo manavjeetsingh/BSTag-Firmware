@@ -583,7 +583,12 @@ class Tag:
 
     def perform_mpp(self, passes=1):
         """
-            Asking the tag to do the MPP, tag stays at each phase for 100ms.
+            Asking the tag to do the MPP. The tag dwells MPP_DWELL_US (3ms) on
+            each entry of MPP_CHANNELS, which is {1,1,1,1,3,4,6,7,8} -- so ch1 is
+            held for 12ms and the rest for 3ms each, 27ms per pass. The leading
+            ch1 repeats are unmeasured padding that absorbs the rectifier's
+            settling ramp; getChannelVoltage() anchors its windows to the end of
+            the capture and so reads the last six dwells.
             This is a blocking call.
             Returns MPP start and end times.
         """

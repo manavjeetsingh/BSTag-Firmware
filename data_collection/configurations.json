@@ -1,12 +1,13 @@
 {
     "EXCITER": "rf_gen",
+    "EXC_POWER_DBM": 12.9,
     "MPP_REPETITIONS": 1,
-    "FREQ_MIN": 775, 
+    "FREQ_MIN": 775,
     "FREQ_MAX": 995,
     "FREQ_JUMP": 10,
     "SAVE_DIR": "C:/git/BSTag-Firmware/data_collection/out",
     "INTER_MPP_BATCH_SLEEP_S": 0,
-    "NUM_EXP_RUNS": 5,
+    "NUM_EXP_RUNS": 10,
     "EXP_NAME": "mpp_testing_multifeq",
     "CHANNELS": [1,3,4,6,7,8]
 }

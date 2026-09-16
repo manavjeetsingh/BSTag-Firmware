@@ -42,7 +42,7 @@ def build_pv_cfg(pv_data):
 def load_hw_config():
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     VNA_data_path = os.path.join(SCRIPT_DIR, "ribbn_scripts/src/ribbn_scripts/calibrations/VNA_data_Sept2026/processed","all_s11_poly.csv")
-    PV_data_path = os.path.join(SCRIPT_DIR, "ribbn_scripts/src/ribbn_scripts/calibrations/PV_data_Sept2026/processed","all_pv_polynomials.csv")
+    PV_data_path = os.path.join(SCRIPT_DIR, "ribbn_scripts/src/ribbn_scripts/calibrations/PV_data_Sept2026_705_995/processed","all_pv_polynomials.csv")
 
     vna_data = pd.read_csv(VNA_data_path)
     pv_data = pd.read_csv(PV_data_path)
@@ -51,8 +51,8 @@ def load_hw_config():
     cfg['s11'] = build_s11_cfg(vna_data)
     cfg['pv'] = build_pv_cfg(pv_data)
 
-    print(cfg['pv']['98:A3:16:8F:DB:94'].keys())
-    exit()
+    # print(cfg['s11']['98:A3:16:8F:DB:94'].keys())
+    # exit()
 
     return cfg
 
@@ -93,7 +93,8 @@ def main():
     
     tag_port_mapping, tag_mac_mapping, mac_tag_mapping=tag_detection()
     mtt.initialize(tag_port_mapping)
-    mtt.test(tag_port_mapping.keys(), exciter_type=configurations["EXCITER"])
+    mtt.test(tag_port_mapping.keys(), exciter_type=configurations["EXCITER"],
+             exc_power=configurations["EXC_POWER_DBM"])
     
     if len(tag_port_mapping)<2:
         raise Exception(f"Need at least two tags, got {len(tag_port_mapping)}")
@@ -116,6 +117,7 @@ def main():
         exciter_type=exciter_type,
         inter_MPP_batch_sleep_time=configurations["INTER_MPP_BATCH_SLEEP_S"],
         channels=configurations["CHANNELS"],
+        exc_power=configurations["EXC_POWER_DBM"],
         tag_mac_mapping=tag_mac_mapping)
 
 
