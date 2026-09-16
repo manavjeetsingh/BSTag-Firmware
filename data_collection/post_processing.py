@@ -9,7 +9,8 @@ Two plots are produced per CSV:
        combined_phase = ((phase_dir1 + phase_dir2) / 2) mod 180   # deg, i.e. mod pi
 
    The combined phase varies across "Run Exp Num" for a fixed (link,
-   frequency), so each link/frequency pair gets a box across runs.
+   frequency), so each link/frequency pair gets a box across runs. Each link
+   gets its own subplot in a shared-frequency-axis stack, written as a PDF.
 
    If --distance is given and the CSV has exactly two unique tags, the
    theoretical phase is overlaid in gray:
@@ -25,7 +26,8 @@ Two plots are produced per CSV:
 
 2. Average voltage irrespective of channel. For every row, the six
    Channel_*_median columns are averaged into one per-row voltage, then
-   boxed per (Rx->Tx direction, frequency) across run exp numbers.
+   boxed per (Rx->Tx direction, frequency) across run exp numbers -- one
+   subplot per direction, written as a PDF.
 
 3. Voltage traces (PDF). One subplot per row for the first --runs run exp
    numbers, showing the complete captured trace against time with the channel
@@ -215,16 +217,26 @@ def plot_voltage_traces(csv_path: str, n_runs: int, output_path: str, freq: floa
 
 def plot_grouped_box(data: pd.DataFrame, ylabel: str, title: str, legend_title: str, output_path: str,
                       theoretical: dict = None, theoretical_label: str = "Theoretical") -> None:
+    """One subplot per unique series (link / direction), stacked and sharing the frequency axis.
+
+    Overlapping every link in one axes made the boxes unreadable once more than a
+    couple of tags were in the CSV; a row each keeps the full box width and lets a
+    single link's frequency sweep be read on its own. Saved as PDF (vector) so the
+    stack can be zoomed without resampling.
+    """
     series_list = sorted(data["series"].unique())
     frequencies = sorted(data["frequency"].unique())
 
-    fig, ax = plt.subplots(figsize=(max(8, len(frequencies) * 0.6), 6))
-
     n_series = len(series_list)
-    group_width = 0.8
-    box_width = group_width / n_series
+    fig, axes = plt.subplots(
+        n_series, 1,
+        figsize=(max(8, len(frequencies) * 0.6), max(3.2, 2.6 * n_series)),
+        sharex=True,
+        squeeze=False,
+    )
+    axes = axes[:, 0]
 
-    for i, series in enumerate(series_list):
+    for i, (series, ax) in enumerate(zip(series_list, axes)):
         color = CATEGORICAL_COLORS[i % len(CATEGORICAL_COLORS)]
         boxes = []
         positions = []
@@ -234,50 +246,48 @@ def plot_grouped_box(data: pd.DataFrame, ylabel: str, title: str, legend_title: 
             if len(vals) == 0:
                 continue
             boxes.append(vals)
-            offset = (i - (n_series - 1) / 2) * box_width
-            positions.append(j + offset)
+            positions.append(j)
             medians.append(float(pd.Series(vals).median()))
 
-        bp = ax.boxplot(
-            boxes,
-            positions=positions,
-            widths=box_width * 0.85,
-            patch_artist=True,
-            manage_ticks=False,
-            boxprops=dict(facecolor=color, alpha=0.55, color=color, linewidth=1.2),
-            medianprops=dict(color=color, linewidth=1.6),
-            whiskerprops=dict(color=color, linewidth=1.2),
-            capprops=dict(color=color, linewidth=1.2),
-            flierprops=dict(
-                marker="o", markersize=4, markerfacecolor=color, markeredgecolor=color, alpha=0.6
-            ),
-        )
-        if n_series > 1:
-            bp["boxes"][0].set_label(series)
+        if boxes:
+            ax.boxplot(
+                boxes,
+                positions=positions,
+                widths=0.6,
+                patch_artist=True,
+                manage_ticks=False,
+                boxprops=dict(facecolor=color, alpha=0.55, color=color, linewidth=1.2),
+                medianprops=dict(color=color, linewidth=1.6),
+                whiskerprops=dict(color=color, linewidth=1.2),
+                capprops=dict(color=color, linewidth=1.2),
+                flierprops=dict(
+                    marker="o", markersize=4, markerfacecolor=color, markeredgecolor=color, alpha=0.6
+                ),
+            )
+            ax.plot(positions, medians, color=color, linewidth=1.4, linestyle="--", zorder=3)
 
-        ax.plot(positions, medians, color=color, linewidth=1.4, linestyle="--", zorder=3)
+        if theoretical is not None:
+            th_positions = [j for j, freq in enumerate(frequencies) if freq in theoretical]
+            th_values = [theoretical[freq] for freq in frequencies if freq in theoretical]
+            ax.plot(th_positions, th_values, color="gray", linewidth=1.6, linestyle="--", marker="o",
+                    markersize=4, zorder=4, label=theoretical_label)
+            ax.legend(frameon=False, fontsize=8, loc="upper right")
 
-    if theoretical is not None:
-        positions = [j for j, freq in enumerate(frequencies) if freq in theoretical]
-        values = [theoretical[freq] for freq in frequencies if freq in theoretical]
-        ax.plot(positions, values, color="gray", linewidth=1.6, linestyle="--", marker="o",
-                markersize=4, zorder=4, label=theoretical_label)
+        ax.set_title(f"{legend_title}: {series}", fontsize=10, loc="left")
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", color="#e1e0d9", linewidth=0.8, zorder=0)
+        ax.set_axisbelow(True)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
 
-    ax.set_xticks(range(len(frequencies)))
-    ax.set_xticklabels(frequencies)
-    ax.set_xlabel("Frequency (MHz)")
-    ax.set_ylabel(ylabel)
-    ax.set_title(title)
-    ax.grid(axis="y", color="#e1e0d9", linewidth=0.8, zorder=0)
-    ax.set_axisbelow(True)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
+    axes[-1].set_xlim(-0.6, len(frequencies) - 0.4)
+    axes[-1].set_xticks(range(len(frequencies)))
+    axes[-1].set_xticklabels(frequencies)
+    axes[-1].set_xlabel("Frequency (MHz)")
 
-    if n_series > 1 or theoretical is not None:
-        ax.legend(title=legend_title, frameon=False)
-
+    fig.suptitle(title)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
+    fig.savefig(output_path)
     plt.close(fig)
     print(f"saved plot to {output_path}")
 
@@ -324,7 +334,7 @@ def main():
             ylabel="Combined phase (deg, mod 180)",
             title="Combined link phase vs. frequency across run exp numbers",
             legend_title="Link",
-            output_path=base + "_combined_phase.png",
+            output_path=base + "_combined_phase.pdf",
             theoretical=theoretical,
             theoretical_label=f"Theoretical (d={args.distance:g} m)" if theoretical is not None else "Theoretical",
         )
@@ -338,7 +348,7 @@ def main():
             ylabel="Average voltage across channels (mV)",
             title="Average voltage (all channels) vs. frequency across run exp numbers",
             legend_title="Direction",
-            output_path=base + "_avg_voltage.png",
+            output_path=base + "_avg_voltage.pdf",
         )
 
     pdf_suffix = f"_voltage_traces_{args.freq:g}MHz.pdf" if args.freq is not None else "_voltage_traces.pdf"

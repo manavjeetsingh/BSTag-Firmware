@@ -274,12 +274,12 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                             
                             # MPP processing and phase calculation
                             channel_median, channels_voltages=getChannelVoltage(_voltages, mpp_stop_time_1, mpp_start_time_1, channels=channels, plotting=False)
-                            phase_theta=cal_theta(channel_median, rxName=tag_mac_mapping[rx_tag], txName=tag_mac_mapping[rx_tag],
+                            phase_theta=cal_theta(channel_median, rxName=tag_mac_mapping[rx_tag], txName=tag_mac_mapping[tx_tag],
                             cfg=hw_config,
                             freq=freq*1e6, #in hz
                             )
                             
-                            print("Phase Deg",phase_theta)
+                            print(f"Tx {tx_tag} -> Rx {rx_tag} | run {run_exp_num}/{num_exp_runs} rep {rep+1}/{mpp_repetitions} | {freq} MHz | Phase Deg {phase_theta}")
                             
                             entry={
                                 "Rx":rx_tag, 
