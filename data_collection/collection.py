@@ -51,7 +51,10 @@ def load_hw_config():
     cfg['s11'] = build_s11_cfg(vna_data)
     cfg['pv'] = build_pv_cfg(pv_data)
 
-    return cfg, pv_data
+    print(cfg['pv']['98:A3:16:8F:DB:94'].keys())
+    exit()
+
+    return cfg
 
 
 def tag_detection():

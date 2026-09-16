@@ -5,7 +5,7 @@ import os
 import json
 import pandas as pd
 
-save_folder = 'PV_data_Sept2026'
+save_folder = 'PV_data_Sept2026_705_995'
 os.makedirs(save_folder + '/processed', exist_ok=True)
 
 fns = set()
@@ -30,7 +30,7 @@ for fn in fns:
         plt.figure()
     pv_polynomials = {}
     rows = []
-    for freq in range(700, 1010, 10):
+    for freq in range(705, 1000, 10):
         x = col_data[freq][0:len(pwr_range)]
         y = np.array(pwr_range)
 

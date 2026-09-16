@@ -7,6 +7,7 @@ def cal_theta(adcs, rxName, txName, cfg, freq):
     phi = []
     attn = []
     for channel in adcs.keys():
+        print(rxName, freq, cfg.keys())
         dbm = np.polyval(cfg['pv'][rxName][freq], np.log(adcs[channel]))
         uW = np.power(10, (dbm - 30) / 10) * 1e6
         amp.append(np.sqrt(uW * 50 * 2))
