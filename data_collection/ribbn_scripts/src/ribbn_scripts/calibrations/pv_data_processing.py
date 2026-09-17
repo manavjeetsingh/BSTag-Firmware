@@ -17,7 +17,7 @@ for f in all_files:
 
 ENABLE_PLOTTING = False
 
-pwr_range = range(-35, -13, 1)
+pwr_range = range(-35, -7, 1)
 target_mVs = [15, 40]
 
 complete_df = pd.DataFrame(columns=["Tag MAC", "Frequency", "Polynomial", "Inverse"] +
