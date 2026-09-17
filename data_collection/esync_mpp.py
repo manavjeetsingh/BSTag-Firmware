@@ -15,10 +15,11 @@ fires its staged command ESYNC_FIRE_DELAY_US later by dead reckoning. The
 host's own jitter no longer matters, because the host is not what starts the
 sweep -- the edge is, and all the tags share it.
 
-This mirrors BladeRFCode/null_sync/manual_null_exciter.py, which is the
-bladeRF version of the same blank and needs a keypress per shot. The rf_gen
-version here is just as good a blank and can be fired from code, which is
-what a frequency sweep needs.
+The blank itself is BladeRFCode/null_sync/manual_null_exciter.py's, which is
+the shape the firmware's detector was written against but needs a keypress
+per shot -- a frequency sweep cannot press keys. Two blanks here can be
+fired from code instead: the rf_gen power drop, and the same bladeRF gate
+as a method call on bladerf_cw.CWExciter.
 
 See esyncMPPTesting_wifi.ipynb for the two-tag manual version of this flow.
 """
@@ -72,7 +73,22 @@ NULL_HOLD_S = 0.030
 # the detector needs ESYNC_WARMUP_SAMPLES (~15 ms) of carrier to seed its
 # baseline before a drop means anything. Firing inside that window means
 # some tags never see the edge.
-ARM_SETTLE_S = 0.25
+#
+# What makes this worth over-paying for is that firing early is invisible.
+# Before the warmup window fills, esyncListening() returns ahead of every
+# threshold test, and priming then adopts the current level instead of
+# calling it an edge -- so a blank that lands there is not rejected and
+# not tallied, it simply never happened as far as the tag is concerned.
+# The round comes back as "pending":0 with rej_short at 0, which reads
+# exactly like an exciter that never blanked.
+#
+# The nominal cost is ~65 ms (50 ms quiet + ~15 ms warmup) measured from
+# each tag's own ack, so 1 s is far more than the budget needs. It is
+# deliberate: the wait is per MPP round against a 30 s ESYNC_WIFI_TIMEOUT_MS,
+# the tags all sit in the same steady carrier while it elapses, and nothing
+# about the sync degrades by waiting longer -- the baseline integrator just
+# settles further. Lower it only with esyncr's "primed" in hand.
+ARM_SETTLE_S = 1.0
 
 # The firmware resumes on its own after ESYNC_WIFI_TIMEOUT_MS if no edge
 # arrives, so waiting past that is how a missed blank is told from a slow
@@ -109,7 +125,7 @@ class NullExciter:
             def describe(self): ...
 
     Factories are called with every resource mainMultiWays has (exc,
-    run_power_dbm, ...) as keyword arguments; take the ones you need and
+    run_power, ...) as keyword arguments; take the ones you need and
     absorb the rest with **_, so adding a resource later does not break the
     implementations that do not want it.
 
@@ -138,13 +154,11 @@ class NullExciter:
 _NULL_EXCITERS = {}
 
 # EXCITER values that name a real exciter which simply cannot be driven from
-# here, kept apart from plain typos so the error can say why.
-_NO_AUTO_BLANK = {
-    'bladerf': ("BladeRFCode/null_sync/manual_null_exciter.py is one keypress "
-                "per shot, which a frequency sweep cannot drive. Driving it "
-                "from code means giving it a trigger input and registering a "
-                "NullExciter for it -- see esync_mpp.NullExciter."),
-}
+# here, kept apart from plain typos so the error can say why. Empty now:
+# 'bladerf' lived here while the only bladeRF blank was manual_null_exciter.py
+# and its one keypress per shot, and moved out when bladerf_cw.py made the
+# same gate a method call.
+_NO_AUTO_BLANK = {}
 
 
 def register_null_exciter(*exciter_types):
@@ -183,28 +197,88 @@ class PowerDropNullExciter(NullExciter):
     the same falling edge, whenever it happens to land.
     """
 
-    def __init__(self, hold_s=NULL_HOLD_S, exc=None, run_power_dbm=None,
+    def __init__(self, hold_s=NULL_HOLD_S, exc=None, run_power=None,
                  null_power_dbm=NULL_POWER_DBM, **_):
         super().__init__(hold_s)
         if exc is None:
             raise Exception("PowerDropNullExciter needs an exciter handle (exc)")
-        if run_power_dbm is None:
-            raise Exception("PowerDropNullExciter needs run_power_dbm to "
-                            "restore the carrier to")
+        if run_power is None:
+            raise Exception("PowerDropNullExciter needs run_power (the run's "
+                            "EXC_POWER) to restore the carrier to")
         self.exc = exc
-        self.run_power_dbm = run_power_dbm
+        self.run_power = run_power
         self.null_power_dbm = null_power_dbm
 
     def fire(self):
         t_drop = time.time()
         self.exc.set_pwr(self.null_power_dbm)
         time.sleep(self.hold_s)
-        self.exc.set_pwr(self.run_power_dbm)
+        self.exc.set_pwr(self.run_power)
         return t_drop, time.time()
 
     def describe(self):
         return (f"{self.hold_s*1e3:g} ms power drop to "
                 f"{self.null_power_dbm:g} dBm")
+
+
+@register_null_exciter('bladerf')
+class GatedBlankNullExciter(NullExciter):
+    """Blank by gating the carrier to zero in baseband and back.
+
+    Named for the mechanism: it works for any exciter whose handle offers
+    blank(hold_s), which today is the bladeRF (bladerf_cw.CWExciter, held
+    directly by this process or reached over the control link of
+    bladerf_exciter_server.py). That is the blank the firmware's detector
+    was written against -- see BladeRFCode/null_sync/manual_null_exciter.py
+    -- with the keypress replaced by a call.
+
+    It differs from the power drop in one way that matters, and it is not
+    depth: the length is applied sample-by-sample in baseband, so it is
+    exact, where a pair of GPIB writes is however long the writes took. So
+    hold_s can sit close to ESYNC_FIRE_DELAY_US here instead of being kept
+    short to leave room for the host's timing to be wrong.
+
+    What it does not change is the tag's rectifier: the carrier goes to zero
+    at the sample it says, and the tag's envelope still takes ~10 ms to fall
+    from there to ESYNC_MIN_BASELINE_MV. The tag latches THAT instant, so it
+    fires ~10 ms later than the gate suggests and a blank of exactly
+    ESYNC_FIRE_DELAY_US still lands the fire safely after the carrier is
+    back.
+    """
+
+    def __init__(self, hold_s=NULL_HOLD_S, exc=None, **_):
+        super().__init__(hold_s)
+        if exc is None or not hasattr(exc, 'blank'):
+            raise Exception(
+                "GatedBlankNullExciter needs an exciter handle (exc) that can "
+                "blank its carrier. For the bladeRF that is a "
+                "bladerf_cw.CWExciter -- see exciters.make_bladerf, which "
+                "builds one here or reaches one on another machine.")
+
+        hold_us = hold_s * 1e6
+        if hold_us <= ESYNC_BLANK_MIN_US:
+            # The tag would throw every one of these away as a fade, and
+            # nothing would fire all run. Cheaper to say so now than to
+            # discover it one 30 s esync window at a time.
+            raise Exception(
+                f"ESYNC_NULL_HOLD_S is {hold_s:g} s, at or under the "
+                f"firmware's ESYNC_BLANK_MIN_US ({ESYNC_BLANK_MIN_US} us): "
+                f"the tags read a blank this short as a fade and never fire.")
+        if hold_us > ESYNC_FIRE_DELAY_US:
+            # Survivable -- the rectifier's fall buys ~10 ms -- but this is
+            # the edge of the window, and past it every tag sweeps an unlit
+            # scene and only esyncr's "returned":0 says so.
+            print(f"WARNING ESYNC_NULL_HOLD_S is {hold_s:g} s, longer than the "
+                  f"firmware's ESYNC_FIRE_DELAY_US "
+                  f"({ESYNC_FIRE_DELAY_US/1e3:g} ms). Watch for "
+                  f"\"returned\":0 in the sync line.")
+        self.exc = exc
+
+    def fire(self):
+        return self.exc.blank(self.hold_s)
+
+    def describe(self):
+        return f"{self.hold_s*1e3:g} ms baseband gate to zero"
 
 
 def make_null_exciter(exciter_type, hold_s=NULL_HOLD_S, **resources):
@@ -214,7 +288,7 @@ def make_null_exciter(exciter_type, hold_s=NULL_HOLD_S, **resources):
     and every capture times out, so this refuses up front rather than
     letting a sweep discover it one 30 s window at a time.
 
-    `resources` is whatever the caller can offer (exc, run_power_dbm, ...);
+    `resources` is whatever the caller can offer (exc, run_power, ...);
     each registered implementation takes what it needs and ignores the rest.
     """
     factory = _NULL_EXCITERS.get(exciter_type)

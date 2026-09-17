@@ -8,6 +8,9 @@ import json
 WIFI_PORT = 3333
 WIFI_TIMEOUT = 10 #sec
 
+BLADERF_PORT = 3334 #control port of bladerf_exciter_server.py
+BLADERF_TIMEOUT = 5 #sec
+
 tag1_mac = b'EC:62:60:4D:34:8C\r\n'
 tag2_mac = b'94:3C:C6:6D:53:5C\r\n'
 tag3_mac = b'10:97:BD:D4:05:10\r\n'
@@ -27,6 +30,134 @@ class Exciter:
     def set_pwr(self, pwr):
         pwr_str = "POW:AMPL " + str(pwr) + "DBM;:OUTP:STAT ON"
         self.inst.write(pwr_str)
+
+
+class BladeRFExciter:
+    """A bladeRF on ANOTHER machine, over the control link of
+    BladeRFCode/null_sync/bladerf_exciter_server.py.
+
+    Not the usual way to drive one. A bladeRF in this machine's USB port is
+    driven in process -- exciters.make_bladerf builds a bladerf_cw.CWExciter
+    and calls it directly, with no server to start and no socket. This class
+    is for the split setup: tags here, radio (and flowgraph) over there.
+
+    Same set_freq/set_pwr/blank as CWExciter, so nothing above this cares
+    which of the two it holds; the only difference is that each call costs a
+    round trip and the server has to already be running -- there is nothing
+    here that can bring a transmitter up.
+
+    set_pwr takes the run's EXC_POWER, and for this exciter that number is
+    TX GAIN IN dB, not a level: a bladeRF has no calibrated output to ask
+    for one. It goes to the radio as given. See POWER IS GAIN in
+    bladerf_cw.py.
+    """
+
+    def __init__(self, host="127.0.0.1", port=BLADERF_PORT,
+                 timeout=BLADERF_TIMEOUT):
+        self.host = host
+        self.port = int(port)
+        self.timeout = timeout
+        self.sock = None
+        self._buf = b''
+        self.connect()
+
+    def connect(self):
+        try:
+            self.sock = socket.create_connection((self.host, self.port),
+                                                 timeout=self.timeout)
+        except OSError as e:
+            raise Exception(
+                f"could not reach the bladeRF exciter server at "
+                f"{self.host}:{self.port} ({e}). This path is only for a "
+                f"bladeRF on another machine, and needs "
+                f"bladerf_exciter_server.py running there. If the bladeRF is "
+                f"in this machine, clear BLADERF_HOST in configurations.json "
+                f"-- the run then drives the radio itself, with no server.")
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._buf = b''
+
+    def _cmd(self, line):
+        """Send one command, return the server's reply, raise on 'err ...'.
+
+        Synchronous by design: every caller here is setting up the carrier
+        the next measurement runs against, so a write that did not land has
+        to be an exception and not a silently wrong run.
+        """
+        if self.sock is None:
+            raise Exception("bladeRF exciter link is closed")
+        self.sock.sendall((line + "\n").encode("ascii"))
+
+        while b"\n" not in self._buf:
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout:
+                raise Exception(f"bladeRF exciter did not answer {line!r} "
+                                f"within {self.timeout}s")
+            if not chunk:
+                raise Exception(f"bladeRF exciter closed the link on {line!r}")
+            self._buf += chunk
+
+        raw, self._buf = self._buf.split(b"\n", 1)
+        reply = raw.decode("ascii", "replace").strip()
+        if reply.startswith("err"):
+            raise Exception(f"bladeRF exciter rejected {line!r}: {reply}")
+        return reply
+
+    def ping(self):
+        return self._cmd("ping")
+
+    def status(self):
+        return self._cmd("status")
+
+    def set_freq(self, freq):
+        """Tune the EMITTED carrier to `freq` MHz (same units as Exciter)."""
+        return self._cmd(f"freq {freq}")
+
+    def set_pwr(self, pwr):
+        """Set the TX gain in dB -- not a level, see the class docstring.
+
+        A negative request (the -30 the tooling parks the exciter at between
+        runs) is below any gain the radio has, so the server reads it as off
+        and mutes the carrier in baseband, which is a deeper off than
+        minimum gain.
+        """
+        return self._cmd(f"power {pwr}")
+
+    def blank(self, hold_s):
+        """Take the carrier to zero for `hold_s`, then bring it back.
+
+        This is the sync blank the tags time off: they latch the falling
+        edge and dead-reckon from it. Returns (t_drop, t_restore) as host
+        wall clock, which is bookkeeping only -- the real blank starts once
+        the samples already queued in the sink have drained, a few tens of
+        ms after this call, and the tags do not care because they time off
+        the edge rather than off anything the host knows.
+        """
+        t_drop = time.time()
+        self._cmd(f"blank {hold_s*1e3:g}")
+        # The gate's length is exact; this sleep is here so the caller does
+        # not go on to the next round while the carrier is still down.
+        time.sleep(hold_s)
+        return t_drop, time.time()
+
+    def carrier_off(self):
+        return self._cmd("off")
+
+    def carrier_on(self):
+        return self._cmd("on")
+
+    def close(self):
+        if self.sock is None:
+            return
+        try:
+            self._cmd("quit")
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
 
 
 class Tag:
@@ -200,16 +331,64 @@ class Tag:
         raise TimeoutError(
             f"{host}:{port} did not come back in {deadline_s}s, last: {last}")
 
-    def fetch_queued_wifi(self, timeout=WIFI_TIMEOUT):
+    def fetch_queued_wifi(self, timeout=WIFI_TIMEOUT, ack=None):
         """
             Pulls the reply the firmware buffered while the radio was down.
             Returns the command's own JSON, or {"info":"qr","pending":0} if
             no queued command ran -- which is how a timed-out window (no
             exciter edge) is told apart from a good one.
+
+            `ack` is for staged commands that do NOT answer in JSON: rdb
+            replies with the plain line "rdb", so qr hands that line back
+            and there is no blob to parse. Pass the token to expect
+            (queue_capture_wifi -> "rdb") and it comes back wrapped as
+            {"info":"qr","pending":1,"cmd":ack}, so callers can keep
+            reading ["pending"] either way. Left as None only JSON is
+            accepted, which is what a staged adc_/mpp_/mac gives.
         """
         discard_read = self._wifi_readline()
         self._wifi_write(bytes("qr\r\n", "UTF8"))
-        return self._read_json(self._wifi_readline, timeout, "fetch_queued_wifi")
+        if ack is None:
+            return self._read_json(self._wifi_readline, timeout,
+                                   "fetch_queued_wifi")
+        return self._read_queued_ack(ack, timeout, "fetch_queued_wifi")
+
+    def _read_queued_ack(self, ack, timeout, what):
+        """
+            qr for a staged command whose reply is plain text.
+
+            Two answers are possible and only one of them is JSON: the
+            firmware's own {"info":"qr","pending":0} (or the overflow blob)
+            when nothing fired, and the staged command's bare ack when it
+            did. JSON is tested first, since the overflow reply carries the
+            command name and would otherwise match `ack` itself.
+        """
+        buffer = ""
+        read_start_time = time.time()
+        while True:
+            if time.time() - read_start_time > timeout:
+                print(f"{what} timed out after {timeout}s waiting for {ack!r} "
+                      f"or a JSON reply; received {len(buffer)} chars so far: "
+                      f"{buffer[:300]!r}")
+                raise Exception("Stuck in " + what)
+
+            line = self._wifi_readline()
+            if len(line) == 0:
+                time.sleep(0.001)
+                continue
+
+            buffer += line.decode(errors='ignore')
+
+            start = buffer.find('{')
+            end = buffer.rfind('}')
+            if start != -1 and end > start:
+                try:
+                    return json.loads(buffer[start:end + 1])
+                except Exception:
+                    pass
+
+            if ack in buffer:
+                return {"info": "qr", "pending": 1, "cmd": ack}
 
     def esync_report(self, timeout=WIFI_TIMEOUT):
         """

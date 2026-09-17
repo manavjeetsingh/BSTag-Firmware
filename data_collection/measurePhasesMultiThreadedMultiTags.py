@@ -1,6 +1,6 @@
 import serial
 import pandas as pd
-from ribbn_scripts.hardware_api.hardware import Tag,Exciter
+from ribbn_scripts.hardware_api.hardware import Tag
 import numpy as np
 import time
 import pickle
@@ -13,6 +13,7 @@ import queue as queue_mod
 from ribbn_scripts.processing.phase_cal import cal_theta
 from ribbn_scripts.processing.mpp_segment import segment_capture, channel_windows
 import esync_mpp
+import exciters
 
 
 COMMAND_RESULT_TYPE = {
@@ -94,7 +95,11 @@ def _collect_esync(tag_instance, want_trace):
     getChannelVoltage() and cal_theta() below need no wireless variant.
     """
     tag_instance.reconnect_wifi(deadline_s=esync_mpp.RECONNECT_DEADLINE_S)
-    queued = tag_instance.fetch_queued_wifi()
+    # want_trace says which command was staged, and that decides how qr
+    # answers: an Rx tag staged rdb, whose reply is the plain line "rdb"
+    # rather than a JSON blob, so qr has to be told what ack to expect. The
+    # Tx tag staged mpp_1 and answers in JSON like everything else.
+    queued = tag_instance.fetch_queued_wifi(ack="rdb" if want_trace else None)
     report = tag_instance.esync_report_wifi()
     trace = tag_instance.stop_reading_wifi() if want_trace else None
     return {"queued": queued, "report": report, "trace": trace}
@@ -180,6 +185,8 @@ FREQ_RANGE=list(range(775,1005,10))
 
 # # Setting up the exciter
 # Default only -- callers normally pass exc_power down from configurations.json
+# (EXC_POWER there). The unit is the exciter's own: dBm on the rf_gen, TX gain
+# in dB on the bladeRF, which has no calibrated output level to ask for.
 EXC_POWER=12.9
 
 
@@ -422,12 +429,18 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                   channels=[1,3,4,6,7,8],
                   exc_power=EXC_POWER,
                   transport=WIRED,
-                  esync_null_hold_s=esync_mpp.NULL_HOLD_S):
+                  esync_null_hold_s=esync_mpp.NULL_HOLD_S,
+                  exciter_settings=None):
     global cmd_qs, result_q, processes
-    
-    exc = None
-    if exciter_type=='rf_gen':
-        exc = Exciter()
+
+    # Whichever exciter EXCITER names -- see exciters.py. Everything below
+    # asks it for a frequency and a level and does not care which one it is.
+    # Normalized here as well as in collection.py because the notebooks in
+    # Testing/ call this directly, and esync_mpp's registry below is keyed
+    # on the same normalized name.
+    exciter_type = exciters.normalize(exciter_type)
+    exc = exciters.make_exciter(exciter_type, **(exciter_settings or {}))
+    if exc is not None:
         exc.set_freq(915)
         exc.set_pwr(exc_power)
         time.sleep(0.1)
@@ -441,9 +454,16 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
     # let the registered implementation for this EXCITER take what it needs.
     null_exciter = None
     if transport == WIRELESS:
-        null_exciter = esync_mpp.make_null_exciter(
-            exciter_type, hold_s=esync_null_hold_s,
-            exc=exc, run_power_dbm=exc_power)
+        try:
+            null_exciter = esync_mpp.make_null_exciter(
+                exciter_type, hold_s=esync_null_hold_s,
+                exc=exc, run_power=exc_power)
+        except Exception:
+            # This refuses on a whole class of misconfiguration (an EXCITER
+            # that cannot blank, a hold length the tags would reject), so
+            # put the carrier down rather than leave it lit on the way out.
+            exciters.shutdown(exc)
+            raise
         print(f"Wireless run: syncing tags off a {null_exciter.describe()}")
 
     csv_path=(f"{save_path}/{exp_name}"
@@ -456,7 +476,7 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
     for run_exp_num in range(num_exp_runs):
         print(f"MPP Batch {run_exp_num}/{num_exp_runs}")
     
-        if exciter_type=='rf_gen':
+        if exc is not None:
             exc.set_pwr(exc_power)
 
         
@@ -478,7 +498,7 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
 
         try:
             for freq in freq_range:
-                if exciter_type=='rf_gen':
+                if exc is not None:
                     exc.set_freq(freq)
                     time.sleep(EXC_SETTLE_S)
 
@@ -562,6 +582,10 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
             print("Had to stop script prematurely. Had the following exception: ",e)
             premature_stop=1
             premature_stop_error=e
+            # Every failure inside a run comes through here, and some of
+            # them (a tag that never fired) leave the carrier up and, for a
+            # networked exciter, a control link the next run cannot take.
+            exciters.shutdown(exc)
             raise e
 
         write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
@@ -575,19 +599,22 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
 
     print(f"Time taken: {time_taken} for {num_exp_runs} runs over {len(freq_range)} freqs")
     
-    if exciter_type=="rf_gen":
-        exc.set_pwr(-30)
+    exciters.shutdown(exc)
         
     return premature_stop
 
 
 
 
-def test(tags, exciter_type, exc_power=EXC_POWER):
+def test(tags, exciter_type, exc_power=EXC_POWER, exciter_settings=None):
     global cmd_qs, processes, result_q
     
-    if exciter_type=='rf_gen':
-        exc = Exciter()
+    # An unsynced check that the tags answer and that the carrier is
+    # reaching them, so it wants the carrier up and nothing else -- no
+    # blank, which is why this takes the exciter itself and not a
+    # NullExciter, and why it works for an EXCITER that cannot blank at all.
+    exc = exciters.make_exciter(exciter_type, **(exciter_settings or {}))
+    if exc is not None:
         exc.set_pwr(exc_power)
         exc.set_freq(915)
     
@@ -645,8 +672,7 @@ def test(tags, exciter_type, exc_power=EXC_POWER):
             print(f"✅ ADC val received for tag {tag_id} is {np.median(data)}")
             adc_results[tag_id] = data
 
-    if exciter_type=='rf_gen':
-        exc.set_pwr(-30)
+    exciters.shutdown(exc)
     
     return {"Test": "done"}
 

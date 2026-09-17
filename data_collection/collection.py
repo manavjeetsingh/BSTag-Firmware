@@ -2,6 +2,7 @@ from init import (get_exising_mapping, get_ports, IGNORE_LIST, get_mac_address,
                   MAC_TAG_FILE, IP_MAC_FILE)
 from ribbn_scripts.hardware_api.hardware import Tag, WIFI_PORT
 import measurePhasesMultiThreadedMultiTags as mtt
+import exciters
 import numpy as np
 import time
 import pickle
@@ -155,10 +156,14 @@ def main():
     configurations = get_exising_mapping("configurations.json")
     print(configurations)
     
-    if configurations["EXCITER"]=="None":
-        exciter_type=None
-    else:
-        exciter_type=configurations["EXCITER"]
+    # EXCITER names the exciter; exciters.py is the one place that knows
+    # what the names mean. Its settings (BLADERF_HOST, ...) are picked out of
+    # the same file by prefix, so a new exciter brings its own keys without
+    # anything here learning them.
+    exciter_type=exciters.normalize(configurations["EXCITER"])
+    exciter_settings=exciters.settings_from_config(configurations)
+    print(f"Exciter: {exciter_type or 'none (drive the carrier yourself)'}"
+          f"{' ' + str(exciter_settings) if exciter_settings else ''}")
 
     # Which transport this run uses end to end: how the tags are found here,
     # and which half of the Tag API the workers drive.
@@ -167,8 +172,9 @@ def main():
 
     tag_endpoint_mapping, tag_mac_mapping, mac_tag_mapping=detect_tags(connection)
     mtt.initialize(tag_endpoint_mapping, transport=connection)
-    mtt.test(tag_endpoint_mapping.keys(), exciter_type=configurations["EXCITER"],
-             exc_power=configurations["EXC_POWER_DBM"])
+    mtt.test(tag_endpoint_mapping.keys(), exciter_type=exciter_type,
+             exc_power=configurations["EXC_POWER"],
+             exciter_settings=exciter_settings)
     
     if len(tag_endpoint_mapping)<2:
         raise Exception(f"Need at least two tags, got {len(tag_endpoint_mapping)}")
@@ -191,13 +197,14 @@ def main():
         exciter_type=exciter_type,
         inter_MPP_batch_sleep_time=configurations["INTER_MPP_BATCH_SLEEP_S"],
         channels=configurations["CHANNELS"],
-        exc_power=configurations["EXC_POWER_DBM"],
+        exc_power=configurations["EXC_POWER"],
         tag_mac_mapping=tag_mac_mapping,
         transport=connection,
         # Wireless only: how long the exciter holds its null. Ignored by a
         # wired run, which does not sync off a blank at all.
         esync_null_hold_s=configurations.get("ESYNC_NULL_HOLD_S",
-                                             mtt.esync_mpp.NULL_HOLD_S))
+                                             mtt.esync_mpp.NULL_HOLD_S),
+        exciter_settings=exciter_settings)
 
 
 
