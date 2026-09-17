@@ -45,7 +45,7 @@ def build_pv_cfg(pv_data):
 def load_hw_config():
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     VNA_data_path = os.path.join(SCRIPT_DIR, "ribbn_scripts/src/ribbn_scripts/calibrations/VNA_data_Sept2026/processed","all_s11_poly.csv")
-    PV_data_path = os.path.join(SCRIPT_DIR, "ribbn_scripts/src/ribbn_scripts/calibrations/PV_data_Sept2026_705_995/processed","all_pv_polynomials.csv")
+    PV_data_path = os.path.join(SCRIPT_DIR, "ribbn_scripts/src/ribbn_scripts/calibrations/PV_data_Sept2026_705_995_-7/processed","all_pv_polynomials.csv")
 
     vna_data = pd.read_csv(VNA_data_path)
     pv_data = pd.read_csv(PV_data_path)
