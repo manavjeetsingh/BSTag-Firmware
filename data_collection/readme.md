@@ -64,6 +64,26 @@ run therefore does not start the sweep from the host at all. Per MPP round
 4. Collect — the firmware holds the radio down until the queued capture
    finishes, so reconnecting *is* the readiness check. Then `qr` (the ack),
    `esyncr` (how the tag saw the blank), and `rds` (the 10000-sample trace).
+5. Check — `check_fired()` reads every tag's `esyncr`. **Any** failure in
+   steps 1–5 drops the round and re-shoots it from step 1, up to
+   `MAX_ROUND_ATTEMPTS` (10) times; only a shot every tag survived is kept,
+   and `result_q` is drained between attempts so a late answer from an
+   abandoned round cannot be read as the next one's.
+
+Retrying wins where the failure is a race — a blind fire (`"returned":0`) is
+one, since the tag commits at the falling edge and fires a fixed delay later
+regardless of when the carrier actually returns. It cannot help where the
+failure is the setup, and the cap is what surfaces those: exhausting it means
+the problem repeats identically every shot. Two worth recognising in the
+`esyncr` line the final error carries:
+
+- `base_mv` at or under 4.0 mV (`ESYNC_MIN_BASELINE_MV / (1 - ESYNC_REARM_PCT)`)
+  — the return threshold has crossed under the floor, so `esyncListening()`
+  bails out before the edge test on every sample. That tag is too dimly lit to
+  tell "lit" from "blanked". It needs more carrier, not more attempts; the
+  `pending:0` error names this case explicitly.
+- Every shot `"returned":0` — `ESYNC_NULL_HOLD_S` is simply longer than
+  `ESYNC_FIRE_DELAY_US`, so lower it.
 
 Because the Rx tags queue `rdb` rather than `adc_<n>`, the trace comes back at
 the full sample rate over the live socket instead of through the 16 KB queued

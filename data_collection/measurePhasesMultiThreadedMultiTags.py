@@ -26,6 +26,7 @@ COMMAND_RESULT_TYPE = {
     "esync_arm": "esync_armed",
     "esync_collect_rx": "esync_result",
     "esync_collect_tx": "esync_result",
+    "esync_reset": "esync_reset",
 }
 
 WIRED = "wired"
@@ -67,6 +68,7 @@ def tag_ops(tag_instance, transport):
             "arm_esync": tag_instance.listen_esync_wifi,
             "collect_esync": lambda want_trace: _collect_esync(
                 tag_instance, want_trace),
+            "reset_esync": lambda: _reset_esync(tag_instance),
         }
     return {
         "get_mac": tag_instance.get_mac,
@@ -77,6 +79,26 @@ def tag_ops(tag_instance, transport):
         "reflect": tag_instance.reflect,
         "disconnect": tag_instance.disconnect,
     }
+
+
+def _reset_esync(tag_instance):
+    """Put a tag back to no-esync-state: not listening, nothing staged.
+
+    Both halves of an esync round are sticky across host restarts, and
+    neither is cleared by connecting. A run that died between `esync` and
+    the edge leaves the detector armed -- the firmware brings its radio
+    back after ESYNC_WIFI_TIMEOUT_MS but goes on listening -- and a q_
+    that never fired stays staged forever. Inherited, the two combine
+    badly: the next round's first blank fires the PREVIOUS run's command,
+    on a detector this run never armed.
+
+    Order matters. Disarm before clearing the queue: clearing first leaves
+    a live detector that could fire on a blank in between, and while the
+    staged slot would be empty by then, runQueuedCommand() would still
+    have consumed the arming this run is about to rely on.
+    """
+    tag_instance.stop_esync_wifi()
+    tag_instance.clear_queued_command_wifi()
 
 
 def _collect_esync(tag_instance, want_trace):
@@ -152,6 +174,14 @@ def device_worker(endpoint, tag_id, command_queue, result_queue, transport=WIRED
             elif command == "esync_arm":
                 ops["arm_esync"]()
                 result_queue.put((tag_id, "esync_armed", True))
+            elif command == "esync_reset":
+                # Bound on the wireless transport only -- a wired run never
+                # arms a detector, so there is nothing to put back. Answer
+                # either way so the barrier completes for mixed setups.
+                reset = ops.get("reset_esync")
+                if reset is not None:
+                    reset()
+                result_queue.put((tag_id, "esync_reset", True))
             elif command == "esync_collect_rx":
                 result_queue.put((tag_id, "esync_result", ops["collect_esync"](True)))
             elif command == "esync_collect_tx":
@@ -316,8 +346,104 @@ def _gather(result_q, res_type, tags, timeout):
 
 
 def MPPMultiWaysEsync(rx_tags, tx_tag, null_exciter, result_q,
-                      channels_settle_s=RX_SETTLE_S):
+                      channels_settle_s=RX_SETTLE_S,
+                      max_attempts=None):
     """One MPP round with every tag started by the exciter, not by the host.
+
+    Re-shoots the round on ANY failure, and returns the first shot every
+    tag survived. See _esyncRound() for the sequence itself.
+
+    Nothing from a failed round is salvaged. A blind fire ("returned":0)
+    means the tag swept while the carrier was still down, so its trace is
+    of an unlit scene -- keeping it would quietly poison the phase
+    estimate rather than just making it noisier -- and a round that
+    errored anywhere else has no complete set of traces to keep in the
+    first place. So the whole round is thrown away and shot again from
+    staging.
+
+    Re-staging is safe from any of these failure points. The workers
+    survive their own exceptions (device_worker catches per command), the
+    firmware's esyncListen() resets the detector and clears the stale
+    queued reply, and queueCommand() overwrites rather than appends. What
+    does NOT clean itself up is result_q: a _gather() that timed out
+    leaves the late answers behind, and they are indistinguishable from
+    fresh ones on the next attempt. Hence the drain below.
+
+    Retrying assumes the failure is a race that another shot can win. Some
+    are not -- a tag whose base_mv sits under ESYNC_MIN_BASELINE_MV is not
+    receiving enough carrier to detect an edge at all, and will report
+    "pending":0 identically on every attempt. The cap is what stops those
+    from spinning: exhausting it is the signal that the problem is the
+    setup, not the shot.
+    """
+    if max_attempts is None:
+        max_attempts = esync_mpp.MAX_ROUND_ATTEMPTS
+
+    last = None
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            # Whatever the last attempt was still waiting on may land now.
+            # _gather() matches on type and tag id, not on which round asked,
+            # so a leftover answer would be read as this attempt's -- pairing
+            # one round's traces with another's esyncr report.
+            dropped = _drainResults(result_q)
+            if dropped:
+                print(f"  sync: dropped {dropped} stale result(s) from the "
+                      f"abandoned attempt")
+
+        try:
+            return _esyncRound(rx_tags, tx_tag, null_exciter, result_q,
+                               channels_settle_s)
+        except esync_mpp.BlindFire as e:
+            last = e
+            print(f"  sync: attempt {attempt}/{max_attempts} fired blind, "
+                  f"dropping this round and re-shooting: {e}")
+        except Exception as e:
+            last = e
+            print(f"  sync: attempt {attempt}/{max_attempts} failed, "
+                  f"dropping this round and re-shooting: {e}")
+
+    if isinstance(last, esync_mpp.BlindFire):
+        raise Exception(
+            f"esync fired blind on all {max_attempts} attempts, so no usable "
+            f"round was collected. This is no longer a race being lost "
+            f"occasionally -- the blank is longer than the tags' "
+            f"ESYNC_FIRE_DELAY_US ({esync_mpp.ESYNC_FIRE_DELAY_US} us) every "
+            f"time. Lower ESYNC_NULL_HOLD_S in configurations.json (currently "
+            f"{null_exciter.hold_s:g} s). Last: {last}")
+
+    raise Exception(
+        f"esync round failed on all {max_attempts} attempts, so no usable "
+        f"round was collected. A failure that repeats this consistently is "
+        f"the setup rather than the shot -- check the esyncr line in the "
+        f"error below. base_mv under ESYNC_MIN_BASELINE_MV "
+        f"({esync_mpp.ESYNC_MIN_BASELINE_MV} mV) means that tag is not lit "
+        f"brightly enough to detect an edge at all, and no retry fixes it. "
+        f"Last: {last}")
+
+
+def _drainResults(result_q):
+    """Empty result_q of answers left over from an abandoned attempt.
+
+    Returns how many were discarded, so a round that keeps tripping over
+    late arrivals says so instead of silently pairing them up wrong.
+    """
+    dropped = 0
+    while True:
+        try:
+            result_q.get_nowait()
+        except queue_mod.Empty:
+            return dropped
+        except Exception:
+            # Some queue backends raise their own flavour of empty; treat
+            # anything unreadable as drained rather than failing the retry.
+            return dropped
+        dropped += 1
+
+
+def _esyncRound(rx_tags, tx_tag, null_exciter, result_q,
+                channels_settle_s=RX_SETTLE_S):
+    """One shot at an MPP round, started by the exciter rather than the host.
 
     The wireless counterpart to MPPMultiWays(). Same inputs and same shape
     of output, so mainMultiWays() can swap one for the other, but the host
@@ -335,6 +461,9 @@ def MPPMultiWaysEsync(rx_tags, tx_tag, null_exciter, result_q,
         ARM_SETTLE_S for the radios to actually go down and the detectors
         to seed their baselines. Fire early and the late tags miss the
         edge entirely.
+
+    Raises esync_mpp.BlindFire if the shot landed mid-blank, which the
+    caller retries; every other failure here aborts the run.
     """
     global cmd_qs
 
@@ -381,10 +510,27 @@ def MPPMultiWaysEsync(rx_tags, tx_tag, null_exciter, result_q,
         raise Exception(f"esync collect failed on tag(s) {sorted(failed)}")
 
     reports = {f"Tag{tag_id}": r["report"] for tag_id, r in results.items()}
+
+    # A tag too dimly lit to detect an edge reports exactly like a tag that
+    # never saw one, so name it before the generic message sends the
+    # operator looking at the exciter's blank instead of its power.
+    stalled = esync_mpp.stalled_tags(reports)
+
     for tag_id, r in results.items():
         if r["queued"].get("pending") == 0:
+            name = f"Tag{tag_id}"
+            if name in stalled:
+                raise Exception(
+                    f"{name}: no queued reply, and its carrier is too weak "
+                    f"for the detector to work: base_mv={stalled[name]} is "
+                    f"at or under {esync_mpp.ESYNC_MIN_BASELINE_MV} mV / "
+                    f"(1 - {esync_mpp.ESYNC_REARM_PCT}%), so the return "
+                    f"threshold has crossed under the floor and esync bails "
+                    f"out before ever testing for an edge. The blank is not "
+                    f"the problem -- this tag needs more carrier (exciter "
+                    f"power, or move/re-aim the tag). esyncr: {r['report']}")
             raise Exception(
-                f"Tag{tag_id}: no queued reply -- the esync window timed out "
+                f"{name}: no queued reply -- the esync window timed out "
                 f"without an edge. Check the exciter is blanking, and see "
                 f"esyncr: {r['report']}")
     esync_mpp.check_fired(reports)
@@ -673,8 +819,49 @@ def test(tags, exciter_type, exc_power=EXC_POWER, exciter_settings=None):
             adc_results[tag_id] = data
 
     exciters.shutdown(exc)
-    
+
+    # Leave the tags with no esync state before the real run stages its own.
+    # This is the last point where every tag is known to be reachable and
+    # idle, and the state being cleared is not this script's -- it is
+    # whatever a previous run left armed or staged when it died. See
+    # _reset_esync(); a "listening":1 in a fresh run's esyncr is the symptom.
+    resetEsyncState(tags)
+
     return {"Test": "done"}
+
+
+def resetEsyncState(tags, timeout=30):
+    """Disarm the detector and clear the staged command on every tag.
+
+    Safe to call on a tag that has neither: `esyncs` and `qc` both answer
+    the same whether or not there was anything to undo.
+
+    Failures are reported and swallowed rather than raised. This is
+    housekeeping before the run proper, and a tag that cannot be reset is
+    about to fail the staging barrier anyway, with a better message than
+    one from here.
+    """
+    global cmd_qs
+
+    targets = [t for t in tags if t in cmd_qs]
+    if not targets:
+        return
+
+    for tag in targets:
+        cmd_qs[tag].put("esync_reset")
+
+    try:
+        got = _gather(result_q, "esync_reset", targets, timeout=timeout)
+    except Exception as e:
+        print(f"⚠️  could not clear esync state: {e}")
+        return
+
+    failed = sorted(t for t, ok in got.items() if not ok)
+    if failed:
+        print(f"⚠️  could not clear esync state on tag(s) {failed}")
+    else:
+        print(f"esync state cleared on {len(targets)} tag(s): "
+              f"not listening, nothing staged")
 
 # if __name__=="__main__":
 #     initialize()

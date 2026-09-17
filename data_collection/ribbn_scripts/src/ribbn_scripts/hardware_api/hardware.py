@@ -465,6 +465,56 @@ class Tag:
         c_str="esync:listening\r\n"
         self._read_until_contains(self._wifi_readline, c_str, timeout, 'no valid answer timeout')
 
+    def stop_esync(self):
+        """
+            Disarms the edge detector (`esyncs`).
+
+            The counterpart to listen_esync(). Needed because arming is
+            sticky in a way that outlives the host: a run killed between
+            `esync` and the edge leaves the tag listening, and the firmware
+            only resumes its radio after ESYNC_WIFI_TIMEOUT_MS -- it does
+            not stop listening. The next run then finds a tag already
+            armed, reporting "listening":1 from somebody else's window.
+        """
+        discard_read=self.ser.readline()
+        self.ser.write(bytes("esyncs\r\n", "UTF8"))
+        self._read_until_contains(self.ser.readline, "esync:stopped", 5,
+                                  'no valid answer timeout')
+
+    def stop_esync_wifi(self, timeout=WIFI_TIMEOUT):
+        """
+            WiFi counterpart to stop_esync().
+        """
+        discard_read=self._wifi_readline()
+        self._wifi_write(bytes("esyncs\r\n", "UTF8"))
+        self._read_until_contains(self._wifi_readline, "esync:stopped",
+                                  timeout, 'no valid answer timeout')
+
+    def clear_queued_command(self):
+        """
+            Drops whatever command is staged to fire on the next edge
+            (`qc`).
+
+            Note this is the staged COMMAND, not the reply it leaves
+            behind -- that is qr's, and esync clears it on the next arm.
+            A q_ that never fired stays staged indefinitely, so without
+            this a run that died after staging leaves the next `esync` to
+            fire a command nobody asked for.
+        """
+        discard_read=self.ser.readline()
+        self.ser.write(bytes("qc\r\n", "UTF8"))
+        self._read_until_contains(self.ser.readline, "q:cleared", 5,
+                                  'no valid answer timeout')
+
+    def clear_queued_command_wifi(self, timeout=WIFI_TIMEOUT):
+        """
+            WiFi counterpart to clear_queued_command().
+        """
+        discard_read=self._wifi_readline()
+        self._wifi_write(bytes("qc\r\n", "UTF8"))
+        self._read_until_contains(self._wifi_readline, "q:cleared", timeout,
+                                  'no valid answer timeout')
+
     def queue_any(self, command_str):
         discard_read=self.ser.readline()
         
@@ -935,13 +985,13 @@ class Tag:
 
 
 class VNA:
-    def __init__(self):
+    def __init__(self,pwr):
         import pyvisa
         rm = pyvisa.ResourceManager()
         self.inst = rm.open_resource('GPIB0::17::INSTR')
         self.inst.write(':SENS1:FREQ:STAR 700E6')
         self.inst.write(':SENS1:FREQ:STOP 3000E6')
-        self.inst.write(':SOUR1:POW -30')
+        self.inst.write(f':SOUR1:POW {pwr}')
         self.inst.write(':SENS1:SWE:DEL 0.001')
         self.inst.write(':SENS1:SWE:POIN 1000')
         self.inst.write(':CALC1:PAR1:DEF S11')

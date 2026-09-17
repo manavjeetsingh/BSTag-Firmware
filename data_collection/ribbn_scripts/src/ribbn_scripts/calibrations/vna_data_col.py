@@ -5,18 +5,18 @@ import numpy as np
 import time
 from matplotlib import pyplot as plt
 
-vna = VNA()
-vna.set_pwr(-15)
+pwr = -15
 
 tag = Tag("COM34")
 save_folder="C:/git/BSTag-Firmware/data_collection/ribbn_scripts/src/ribbn_scripts/calibrations/VNA_data_Sept2026"
+
+vna = VNA(pwr)
 
 tag_name=tag.get_mac().replace(":",'_')
 print(tag_name)
 
 tag.reflect(2)
 time.sleep(1)
-pwr = -15
 vna.set_pwr(pwr)
 time.sleep(1)
 

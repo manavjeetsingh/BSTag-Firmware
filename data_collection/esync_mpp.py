@@ -34,6 +34,13 @@ ESYNC_FIRE_DELAY_US = 50000    # ESYNC_FIRE_DELAY_US: when the tag fires,
                                # measured from the falling edge
 ESYNC_BLANK_MIN_US = 10000     # ESYNC_BLANK_MIN_US: shorter than this and
                                # the tag calls it a fade and does not fire
+ESYNC_MIN_BASELINE_MV = 2.0    # ESYNC_MIN_BASELINE_MV: the floor. A sample
+                               # at or under this IS the falling edge, so it
+                               # is also the level the idle carrier has to
+                               # sit well above for the detector to work at
+                               # all -- see stalled_tags()
+ESYNC_REARM_PCT = 50           # ESYNC_REARM_PCT: % below baseline that
+                               # counts as the carrier being back
 ESYNC_WIFI_QUIET_MS = 50       # ESYNC_WIFI_QUIET_MS: ack drain before the
                                # radio goes down
 ESYNC_WIFI_TIMEOUT_MS = 30000  # ESYNC_WIFI_TIMEOUT_MS: firmware gives up
@@ -90,10 +97,51 @@ NULL_HOLD_S = 0.030
 # settles further. Lower it only with esyncr's "primed" in hand.
 ARM_SETTLE_S = 1.0
 
+# How many times one MPP round may be re-shot after a BlindFire before the
+# run gives up.
+#
+# A blind fire is dropped and retried rather than kept, so without a cap a
+# hold that is simply too long would spin here forever, one full round per
+# attempt, quietly producing nothing. The cap turns that into an error that
+# names the real fix.
+#
+# Sized for a race lost occasionally, not systematically: if ESYNC_NULL_HOLD_S
+# is close enough to ESYNC_FIRE_DELAY_US that more than a few shots in a row
+# come back "returned":0, the hold is wrong and no amount of retrying is the
+# answer.
+MAX_ROUND_ATTEMPTS = 10
+
 # The firmware resumes on its own after ESYNC_WIFI_TIMEOUT_MS if no edge
 # arrives, so waiting past that is how a missed blank is told from a slow
 # one rather than something to sit through.
 RECONNECT_DEADLINE_S = ESYNC_WIFI_TIMEOUT_MS / 1000.0 + 30.0
+
+
+class BlindFire(Exception):
+    """A tag fired while the carrier was still down ("returned":0).
+
+    Its own class because it is the one check_fired() failure worth
+    RETRYING rather than aborting the run. The others say something about
+    the setup that another attempt cannot change -- a blank that never
+    reaches the floor at a tag will not reach it next time either. This
+    one is a race that is lost intermittently: the tag commits at the
+    falling edge and fires ESYNC_FIRE_DELAY_US later no matter what, so
+    whether the carrier is back in time depends on where the blank's end
+    lands relative to a fixed deadline. With ESYNC_NULL_HOLD_S near
+    ESYNC_FIRE_DELAY_US that is decided round by round.
+
+    The round's data is garbage -- the tags swept an unlit scene -- so it
+    is dropped, not salvaged. `reports` carries the esyncr lines that
+    condemned it, for logging after the retry.
+
+    Losing this race EVERY time is a different thing, and no number of
+    retries fixes it: the hold is simply too long. That is what the
+    attempt cap in MPPMultiWaysEsync() exists to surface.
+    """
+
+    def __init__(self, message, reports=None):
+        super().__init__(message)
+        self.reports = reports or {}
 
 
 class NullExciter:
@@ -315,6 +363,39 @@ def make_null_exciter(exciter_type, hold_s=NULL_HOLD_S, **resources):
         f"({exciter_type!r}), or run this CONNECTION: wired.")
 
 
+def stalled_tags(reports):
+    """Tags whose idle carrier is too low for the detector to work at all.
+
+    esyncListening() compares the return threshold (ESYNC_REARM_PCT below
+    the tracked baseline) against the fixed floor, and when the two cross
+    over it bails out before the edge test -- on every sample, forever:
+
+        rearm_thr = baseline * (100 - ESYNC_REARM_PCT) / 100
+        if (rearm_thr <= drop_thr)  ->  no edge detection at all
+
+    So a tag stalls once base_mv reaches
+    ESYNC_MIN_BASELINE_MV / (1 - ESYNC_REARM_PCT/100): 4.0 mV at the stock
+    2.0 mV floor and 50%. Below that the carrier is so weak that "lit" and
+    "blanked" are the same level to the tag, and there is nothing to
+    detect an edge between.
+
+    Worth naming separately because it is indistinguishable, in the report,
+    from a tag that simply never saw a blank: "pending":0, rej_short 0,
+    armed 0. But the remedy is the opposite of a retry. No number of shots,
+    and no change to the blank's length or depth, makes an unlit tag see an
+    edge -- only more carrier at that tag does.
+
+    Returns {name: base_mv} for the tags in this state.
+    """
+    headroom = 1.0 - ESYNC_REARM_PCT / 100.0
+    if headroom <= 0.0:
+        return {}
+    floor = ESYNC_MIN_BASELINE_MV / headroom
+
+    return {name: r["base_mv"] for name, r in reports.items()
+            if r.get("base_mv") is not None and r["base_mv"] <= floor}
+
+
 def check_fired(reports, raise_on_blind=True):
     """Confirm every tag fired, and against the same blank.
 
@@ -353,19 +434,24 @@ def check_fired(reports, raise_on_blind=True):
     if problems:
         raise Exception("; ".join(problems))
 
+    blind = []
     for name, r in reports.items():
         if not r.get("returned"):
-            msg = (f"{name} fired blind: the carrier still had not returned "
-                   f"{r.get('delay_us')} us after the falling edge, so the "
-                   f"tag swept with nothing illuminating it. The blank is "
-                   f"longer than ESYNC_FIRE_DELAY_US assumes -- lower "
-                   f"NULL_HOLD_S / ESYNC_NULL_HOLD_S.")
-            if raise_on_blind:
-                raise Exception(msg)
-            print(f"WARNING {msg}")
+            blind.append(
+                f"{name} fired blind: the carrier still had not returned "
+                f"{r.get('delay_us')} us after the falling edge, so the "
+                f"tag swept with nothing illuminating it. The blank is "
+                f"longer than ESYNC_FIRE_DELAY_US assumes -- lower "
+                f"NULL_HOLD_S / ESYNC_NULL_HOLD_S.")
         if r.get("long"):
             print(f"WARNING {name}: blank ran long ({r['low_us']} us) -- "
                   f"synced against an outage?")
+
+    if blind:
+        if raise_on_blind:
+            raise BlindFire("; ".join(blind), reports)
+        for msg in blind:
+            print(f"WARNING {msg}")
 
     # t_us is each tag's own uptime, so it is NOT comparable between tags.
     # low_us is a measured duration, so it is. Read it as an approximation:
