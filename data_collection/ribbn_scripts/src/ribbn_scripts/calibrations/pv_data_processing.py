@@ -23,6 +23,9 @@ target_mVs = [15, 40]
 complete_df = pd.DataFrame(columns=["Tag MAC", "Frequency", "Polynomial", "Inverse"] +
                             [f"Required Power @{t}mV (dBm)" for t in target_mVs])
 
+# raw measurements behind the fits: one row per (tag, frequency), sweeps kept as lists
+measurement_rows = []
+
 for fn in fns:
     col_data = read_pickle(save_folder+'/'+fn+'_pv_dat.pkl')
 
@@ -33,6 +36,13 @@ for fn in fns:
     for freq in range(705, 1000, 10):
         x = col_data[freq][0:len(pwr_range)]
         y = np.array(pwr_range)
+
+        measurement_rows.append({
+            "Tag MAC": fn,
+            "Frequency": freq,
+            "Power (dBm)": [int(pwr) for pwr in y],
+            "Voltage (mV)": [float(mV) for mV in x],
+        })
 
         p = np.polyfit(np.log(x), y, 2)
         p_inv = np.polyfit(y, np.log(x), 2)
@@ -70,6 +80,10 @@ for fn in fns:
         json.dump(pv_polynomials, j_f, indent=4)
 
 complete_df.to_csv(f"{save_folder}/processed/all_pv_polynomials.csv", index=False)
+
+measurement_df = pd.DataFrame(measurement_rows,
+                              columns=["Tag MAC", "Frequency", "Power (dBm)", "Voltage (mV)"])
+measurement_df.to_csv(f"{save_folder}/processed/all_pv_measurements.csv", index=False)
 
 if ENABLE_PLOTTING:
     plt.show()

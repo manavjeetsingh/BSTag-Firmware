@@ -9,7 +9,7 @@
  * This is independent of (and stronger than) the runtime switch: with
  * this at 1, an empty WIFI_SSID in secrets.h still disables the radio at
  * runtime (see wifiStart()) but the WiFi/TCP code is still linked in. */
-#define NET_ENABLED             0
+#define NET_ENABLED             1
 
 #if NET_ENABLED
 #include "secrets.h"

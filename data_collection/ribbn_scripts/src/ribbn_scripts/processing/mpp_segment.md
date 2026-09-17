@@ -67,32 +67,60 @@ The tag's own sampling was never the problem. The dwell measures exactly 200 sam
 
 ## 3. Reducing the problem to one unknown
 
-The dwell length is not really unknown — it is hardware. 3 ms at the tag's sample-loop rate is 200 samples, confirmed empirically across every capture. So the grid is **rigid**, and the only thing left to find is *where it starts*.
+The dwell length is not really unknown — it is hardware. 3 ms at the tag's sample-loop rate is 200 samples, confirmed empirically across every capture. So the grid is **rigid**: six blocks of known width, laid end to end. The only thing left to find is *where it starts*.
 
-This matters more than it sounds. Fitting the dwell per-trace as a free parameter was tried and is strictly worse (§6): it is degenerate, because a slightly-wrong dwell that straddles boundaries still produces large differences between blocks.
+```
+[--- lead-in ---][ch1][ch1][ch1][ch1][ch3][ch4][ch6][ch7][ch8][- tail -]
+                            ^prev ^start
+                            |     |
+                            |     the six blocks we want
+                            the padding block just before
+```
 
-`DWELL_TOLERANCE` (±3%) is searched anyway, purely to absorb drift if the firmware's sample loop rate ever shifts. Results are insensitive to it.
+That single unknown is found by **brute force**: try every possible start index, score how much the resulting layout looks like a real sweep, and keep the best. That is the whole algorithm — the rest of this section is why the grid is rigid, and §4 is the scoring.
+
+`DWELL_TOLERANCE` (±3%) widens the search to dwells of 194–206 samples, purely to absorb drift if the firmware's sample loop rate ever shifts. Results are insensitive to it.
+
+Fitting the dwell per-trace as a genuinely free parameter was tried and is strictly worse (§6): it is degenerate, because a slightly-wrong dwell that straddles boundaries still produces large differences between blocks.
 
 ---
 
 ## 4. The scoring function
 
-For a candidate start `s` and dwell `D`, lay down six consecutive blocks `B0…B5` covering the measured windows, plus the padding block `prev = [s-D, s)` immediately before:
+For a candidate start `s` and dwell `D`, lay down six consecutive blocks `B0…B5` covering the measured windows, plus the padding block `prev = [s-D, s)` immediately before. Take the **mean voltage of each of those seven blocks**:
 
 ```
-score(s, D) =   |B1-B0| + |B2-B1| + |B3-B2| + |B4-B3| + |B5-B4|      (A)
-              - |B0 - prev|                                          (B)
+ prev    B0     B1     B2     B3     B4     B5
+  |      |      |      |      |      |      |
+        [s]
 ```
 
-Pick the `(s, D)` that maximises it. Each term blocks a different failure:
+Then:
 
-**(A) — the five channel switches should be large.**
-Guards against the grid sliding one dwell **too far left**. If it does, `B0` and `B1` both land on ch1, that boundary contributes nothing, and only 4 real steps are captured instead of 5.
+```
+score(s, D) =   |B1-B0| + |B2-B1| + |B3-B2| + |B4-B3| + |B5-B4|      (A)  reward big steps inside
+              - |B0 - prev|                                          (B)  punish a step at the left edge
+```
 
-**(B) — the ch1 entry must be flat.**
-Guards against sliding one dwell **too far right**. If it does, `B0` lands on ch3 while `prev` is still ch1, producing a large step exactly where there should be none.
+Pick the `(s, D)` that **maximises** it. One idea per line:
 
-Term (B) is only valid because of the four-fold ch1 repeat: the padding dwell is *guaranteed* to be the same channel as the first measured window, making that the one boundary in the whole sweep that must be flat. Without it the grid can drift rightward off ch1 undetected. **The padding that looks like a settling hack is what anchors the grid's phase.**
+**(A) — the five internal boundaries are real channel switches, so the voltage should jump at each one.** A correct alignment collects all five jumps. This guards against the grid sliding one dwell **too far left**: if it does, `B0` and `B1` both land on ch1, that boundary contributes nothing, and only 4 real steps are captured instead of 5.
+
+**(B) — `prev` and `B0` are both ch1, so that one boundary must be flat.** This guards against sliding one dwell **too far right**: if it does, `B0` lands on ch3 while `prev` is still ch1, producing a large step exactly where there should be none.
+
+Term (A) alone cannot tell you that the grid slid right — you would still see five large jumps, just the wrong five. Term (B) is what pins the phase, and it is only valid because of the four-fold ch1 repeat: the padding dwell is *guaranteed* to be the same channel as the first measured window, making that the one boundary in the whole sweep that must be flat. **The padding that looks like a settling hack is what anchors the grid's phase.**
+
+### Worked example
+
+Say the true block levels are ch1 = 10, ch3 = 14, ch4 = 9, ch6 = 12, ch7 = 7, ch8 = 11 mV, with the tail sitting at 11.
+
+| alignment | the six blocks | `prev` | (A) rewards | (B) penalty | **score** |
+|---|---|---|---|---|---|
+| **correct** | 10, 14, 9, 12, 7, 11 | 10 (ch1) | 4+5+3+5+4 = 21 | \|10−10\| = 0 | **21** |
+| one dwell too far left | 10, 10, 14, 9, 12, 7 | 10 (ch1) | 0+4+5+3+5 = 17 | \|10−10\| = 0 | **17** |
+| one dwell too far right | 14, 9, 12, 7, 11, 11 | 10 (ch1) | 5+3+5+4+0 = 17 | \|14−10\| = 4 | **13** |
+
+Sliding left wastes a boundary on ch1→ch1, which contributes 0. Sliding right both wastes the ch8→tail boundary *and* eats the penalty. The correct alignment wins on both counts, and the right-shift — the failure mode the old wall-clock method actually had — loses by the larger margin.
 
 ---
 
@@ -102,11 +130,12 @@ The algorithm compares **block averages, never adjacent samples**.
 
 This is the difference between working and not working on weak captures. A naive "find the largest single-sample jump" edge detector is fine when the channel steps are 10–20 mV, but collapses when the whole trace spans 2 mV and the largest step (0.9 mV) is comparable to the sample-to-sample noise (~0.5 mV).
 
-Each block holds ~184 usable samples after trimming, so noise on the block mean falls by √184 ≈ 13.6×. A 0.5 mV step that is invisible in a differenced signal becomes a confident detection once integrated.
+Each block holds ~184 usable samples after trimming, so noise on the block mean falls by √184 ≈ 13.6×. A 0.5 mV step that is invisible in a differenced signal becomes a confident detection once integrated. This is the single reason the module works at all on the 2 mV set.
 
-Two implementation details:
+Three implementation details:
 
-- **Means for the search, medians for the result.** Block means come from a cumulative sum, making each candidate O(1) — the whole search runs 40 traces in well under a second. Noise here is symmetric, so means are unbiased. The values actually reported are medians, which resist the occasional outlier sample.
+- **A cumulative sum makes each candidate O(1).** `cs = np.cumsum(v)` is built once, after which any block's mean is `(cs[b] - cs[a]) / (b - a)` rather than a fresh 200-sample average. `starts` is also an array, so every candidate position at a given dwell is scored in one vectorised pass. Together these are why the whole search runs 40 traces in well under a second despite being exhaustive.
+- **Means for the search, medians for the result.** Noise here is symmetric, so means are unbiased and cheap. The values actually reported are medians, which resist the occasional outlier sample.
 - **`EDGE_TRIM = 8`** drops 8 samples either side of every boundary, since those catch the switch transition rather than a settled level.
 
 ---
