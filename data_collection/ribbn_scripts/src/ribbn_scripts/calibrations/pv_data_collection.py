@@ -8,14 +8,14 @@ exc = Exciter()
 exc.set_freq(915)
 exc.set_pwr(-30)
 
-save_folder='PV_data_Sept2026705_995'
+save_folder='PV_data_Sept2026_705_995_-7'
 
 
-tag = Tag("COM29")
+tag = Tag("COM31")
 fn=tag.get_mac().replace(":",'_')
 tag.reflect(2)
 
-pwr_range = range(-35, -13, 1)
+pwr_range = range(-35, -7, 1)
 tim_delay = 0.1
 col_data = {}
 

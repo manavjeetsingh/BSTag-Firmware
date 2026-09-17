@@ -5,7 +5,7 @@ import os
 import json
 import pandas as pd
 
-save_folder = 'PV_data_Sept2026_705_995'
+save_folder = 'PV_data_Sept2026_705_995_-7'
 os.makedirs(save_folder + '/processed', exist_ok=True)
 
 fns = set()
