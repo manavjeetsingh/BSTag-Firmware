@@ -1,4 +1,6 @@
 {
+    "CONNECTION": "wired",
+    "ESYNC_NULL_HOLD_S": 0.03,
     "EXCITER": "rf_gen",
     "EXC_POWER_DBM": 12.9,
     "MPP_REPETITIONS": 1,

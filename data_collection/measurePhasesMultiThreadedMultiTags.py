@@ -9,8 +9,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import multiprocessing
+import queue as queue_mod
 from ribbn_scripts.processing.phase_cal import cal_theta
 from ribbn_scripts.processing.mpp_segment import segment_capture, channel_windows
+import esync_mpp
 
 
 COMMAND_RESULT_TYPE = {
@@ -18,45 +20,142 @@ COMMAND_RESULT_TYPE = {
     "perform_mpp": "mpp_times",
     "stop_reading": "voltage_readings",
     "get_adc_val": "adc_vals",
+    "esync_stage_mpp": "esync_staged",
+    "esync_stage_capture": "esync_staged",
+    "esync_arm": "esync_armed",
+    "esync_collect_rx": "esync_result",
+    "esync_collect_tx": "esync_result",
 }
 
-def device_worker(com_port, tag_id, command_queue, result_queue):
+WIRED = "wired"
+WIRELESS = "wireless"
+
+
+def connect_tag(endpoint, transport):
+    """Open one tag over whichever transport the run is using.
+
+    `endpoint` is a serial port for WIRED and an IP for WIRELESS. Nothing
+    past this function knows the difference -- the two transports speak the
+    same command protocol, so the only thing that varies is which set of
+    methods (foo / foo_wifi) is bound below.
+    """
+    if transport == WIRELESS:
+        return Tag.over_wifi(endpoint)
+    if transport == WIRED:
+        return Tag(endpoint)
+    raise ValueError(f"unknown transport {transport!r}, expected "
+                     f"{WIRED!r} or {WIRELESS!r}")
+
+
+def tag_ops(tag_instance, transport):
+    """Bind the logical operations to this transport's methods."""
+    if transport == WIRELESS:
+        return {
+            "get_mac": tag_instance.get_mac_wifi,
+            "begin_reading": tag_instance.begin_reading_wifi,
+            "perform_mpp": tag_instance.perform_mpp_wifi,
+            "stop_reading": tag_instance.stop_reading_wifi,
+            "get_adc_val": tag_instance.get_adc_val_wifi,
+            "reflect": tag_instance.reflect_wifi,
+            "disconnect": tag_instance.disconnect_wifi,
+            # esync: staged here, fired by the exciter's blank, collected
+            # after the radio comes back. Wireless only -- over serial there
+            # is no radio to suspend and the wired timing is good enough.
+            "stage_mpp": lambda: tag_instance.queue_mpp_wifi(1),
+            "stage_capture": tag_instance.queue_capture_wifi,
+            "arm_esync": tag_instance.listen_esync_wifi,
+            "collect_esync": lambda want_trace: _collect_esync(
+                tag_instance, want_trace),
+        }
+    return {
+        "get_mac": tag_instance.get_mac,
+        "begin_reading": tag_instance.begin_reading,
+        "perform_mpp": tag_instance.perform_mpp,
+        "stop_reading": tag_instance.stop_reading,
+        "get_adc_val": tag_instance.get_adc_val,
+        "reflect": tag_instance.reflect,
+        "disconnect": tag_instance.disconnect,
+    }
+
+
+def _collect_esync(tag_instance, want_trace):
+    """Pick up what a tag did while its radio was down.
+
+    Runs inside the worker process, after the blank. reconnect_wifi() IS
+    the wait: the listener only comes back once the firmware resumes, and
+    the firmware holds the resume until the queued capture has finished
+    (loop() in the .ino gates it on captureActive()). So by the time this
+    connects, an Rx tag's 10000 samples are already sitting in the capture
+    buffer, and rds just hands them over on the live socket.
+
+    That is why the Rx tags queue rdb rather than adc_<n>: the trace does
+    not have to fit QUEUED_REPLY_BUF_LEN, it comes back at the full sample
+    rate, and it is shaped exactly like a wired capture -- so
+    getChannelVoltage() and cal_theta() below need no wireless variant.
+    """
+    tag_instance.reconnect_wifi(deadline_s=esync_mpp.RECONNECT_DEADLINE_S)
+    queued = tag_instance.fetch_queued_wifi()
+    report = tag_instance.esync_report_wifi()
+    trace = tag_instance.stop_reading_wifi() if want_trace else None
+    return {"queued": queued, "report": report, "trace": trace}
+
+
+def device_worker(endpoint, tag_id, command_queue, result_queue, transport=WIRED):
     """
     A worker function to be run in a separate PROCESS. It instantiates its
     own Tag object to avoid sharing non-serializable objects.
+
+    `endpoint` is a COM/tty port under WIRED and an IP address under
+    WIRELESS; a wireless run has no serial cable attached at all.
     """
-    print(f"Process for Tag {tag_id} on {com_port} started.")
-    # Each process creates its own instance of the Tag class
-    tag_instance = Tag(com_port)
+    print(f"Process for Tag {tag_id} on {endpoint} ({transport}) started.")
+    # Each process creates its own instance of the Tag class -- and, over
+    # wifi, its own TCP session, so each one takes a session slot of its own
+    # (MAX_TCP_CLIENTS in the firmware's config.h).
+    tag_instance = connect_tag(endpoint, transport)
+    ops = tag_ops(tag_instance, transport)
 
     while True:
         command = command_queue.get()
 
         if command == "STOP":
-            tag_instance.disconnect()
+            ops["disconnect"]()
             print(f"Process for Tag {tag_id} stopping.")
             break
 
         try:
             if command == "get_mac":
-                result = tag_instance.get_mac()
+                result = ops["get_mac"]()
                 result_queue.put((tag_id, "mac", result))
             elif command == "begin_reading":
-                tag_instance.begin_reading()
+                ops["begin_reading"]()
             elif command == "perform_mpp":
-                result = tag_instance.perform_mpp()
+                result = ops["perform_mpp"]()
                 result_queue.put((tag_id, "mpp_times", result))
             elif command == "stop_reading":
-                result = tag_instance.stop_reading()
+                result = ops["stop_reading"]()
                 result_queue.put((tag_id, "voltage_readings", result))
             elif command == "get_adc_val":
-                result = tag_instance.get_adc_val()
+                result = ops["get_adc_val"]()
                 result_queue.put((tag_id, "adc_vals", result))
+            elif command == "esync_stage_mpp":
+                ops["stage_mpp"]()
+                result_queue.put((tag_id, "esync_staged", True))
+            elif command == "esync_stage_capture":
+                ops["stage_capture"]()
+                result_queue.put((tag_id, "esync_staged", True))
+            elif command == "esync_arm":
+                ops["arm_esync"]()
+                result_queue.put((tag_id, "esync_armed", True))
+            elif command == "esync_collect_rx":
+                result_queue.put((tag_id, "esync_result", ops["collect_esync"](True)))
+            elif command == "esync_collect_tx":
+                result_queue.put((tag_id, "esync_result", ops["collect_esync"](False)))
             elif command[:2]=='ch':
-                tag_instance.reflect(int(command[3:]))
+                ops["reflect"](int(command[3:]))
 
         except Exception as e:
-            print(f"🛑 ERROR in process for Tag {tag_id} ({com_port}): {e}")
+            print(f"🛑 ERROR in process for Tag {tag_id} ({endpoint}): {e}")
             # Whoever sent `command` is blocked waiting on a matching
             # result_queue entry (see MPPMultiWays) -- without this they'd
             # wait forever. None marks the reading as failed/missing.
@@ -101,16 +200,21 @@ cmd_qs = {}
 result_q = None 
 processes = {}
 
-def initialize(tag_port_mapping):
+def initialize(tag_endpoint_mapping, transport=WIRED):
+    """Spawn one worker process per tag.
+
+    `tag_endpoint_mapping` is {"TagN": endpoint}: serial ports under WIRED,
+    IP addresses under WIRELESS.
+    """
     global cmd_qs, result_q, processes
-    n_tags = len(tag_port_mapping)
+    n_tags = len(tag_endpoint_mapping)
     result_q = multiprocessing.Queue()
     
     # Create queues from the multiprocessing module
-    for tag in tag_port_mapping.keys():
+    for tag in tag_endpoint_mapping.keys():
         local_queue = multiprocessing.Queue()
         cmd_qs[tag]= local_queue
-        processes[tag] = multiprocessing.Process(target=device_worker, args=(tag_port_mapping[tag], int(tag[3:]), local_queue, result_q), daemon=True)
+        processes[tag] = multiprocessing.Process(target=device_worker, args=(tag_endpoint_mapping[tag], int(tag[3:]), local_queue, result_q, transport), daemon=True)
     
 
     # Start the child processes
@@ -174,6 +278,116 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
     return voltage_readings, mpp_start_time, mpp_stop_time
 
 
+def _gather(result_q, res_type, tags, timeout):
+    """Block until every tag in `tags` has answered with `res_type`.
+
+    The barrier the esync sequence is built out of: nothing may be sent to
+    the exciter until every tag has acked its arm, or the ones still
+    talking miss the edge. Results of other types are stale answers from an
+    abandoned round and are dropped.
+
+    A worker that raised puts None (see device_worker), which arrives here
+    as a normal answer and is reported by the caller rather than hanging.
+    """
+    want = {int(t[3:]) for t in tags}
+    got = {}
+    deadline = time.time() + timeout
+    while len(got) < len(want):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            missing = sorted(want - set(got))
+            raise Exception(
+                f"timed out after {timeout}s waiting for {res_type} from "
+                f"tag(s) {missing}")
+        try:
+            tag_id, rt, data = result_q.get(timeout=remaining)
+        except queue_mod.Empty:
+            continue
+        if rt == res_type and tag_id in want:
+            got[tag_id] = data
+    return got
+
+
+def MPPMultiWaysEsync(rx_tags, tx_tag, null_exciter, result_q,
+                      channels_settle_s=RX_SETTLE_S):
+    """One MPP round with every tag started by the exciter, not by the host.
+
+    The wireless counterpart to MPPMultiWays(). Same inputs and same shape
+    of output, so mainMultiWays() can swap one for the other, but the host
+    never tells a tag "go" -- it stages the work, steps out of the timing
+    path while the radios sleep, and blanks the carrier once. Every tag
+    fires off that one shared edge.
+
+    Order matters at two points:
+
+      - Everything is staged BEFORE any tag is armed. `esync` makes the
+        firmware suspend the radio within ESYNC_WIFI_QUIET_MS of acking,
+        so a q_ sent to an armed tag never lands.
+
+      - The blank comes only after every tag has acked its arm, plus
+        ARM_SETTLE_S for the radios to actually go down and the detectors
+        to seed their baselines. Fire early and the late tags miss the
+        edge entirely.
+    """
+    global cmd_qs
+
+    all_tags = [tx_tag] + list(rx_tags)
+
+    # 1. Stage. Rx tags capture (rdb), the Tx tag sweeps (mpp_1).
+    cmd_qs[tx_tag].put("esync_stage_mpp")
+    for rx_tag in rx_tags:
+        cmd_qs[rx_tag].put("esync_stage_capture")
+    _gather(result_q, "esync_staged", all_tags, timeout=30)
+
+    # 2. Arm. From here the radios are going down; nothing more can be sent.
+    for tag in all_tags:
+        cmd_qs[tag].put("esync_arm")
+    _gather(result_q, "esync_armed", all_tags, timeout=30)
+
+    # 3. Let the radios actually go down before anything else happens.
+    #
+    #    This wait is load-bearing twice over, and both failures are quiet.
+    #    The detector needs carrier to seed its baseline before a drop means
+    #    anything, so firing early means tags that never see the edge. And
+    #    the firmware only suspends ESYNC_WIFI_QUIET_MS after acking, so a
+    #    collect dispatched inside that gap finds the OLD socket still open,
+    #    reconnect_wifi() returns immediately on a connection that is about
+    #    to be dropped, and qr is read before the tag has fired.
+    time.sleep(esync_mpp.ARM_SETTLE_S)
+
+    # 4. Now the workers can start waiting. With the radios down the
+    #    reconnect can only succeed once the firmware resumes, which is what
+    #    makes retrying it the readiness check.
+    cmd_qs[tx_tag].put("esync_collect_tx")
+    for rx_tag in rx_tags:
+        cmd_qs[rx_tag].put("esync_collect_rx")
+
+    # 5. The shot.
+    mpp_start_time, mpp_stop_time = null_exciter.fire()
+
+    # 6. Pick up the pieces once every radio is back.
+    results = _gather(result_q, "esync_result", all_tags,
+                      timeout=esync_mpp.RECONNECT_DEADLINE_S + 60)
+
+    failed = [t for t, r in results.items() if r is None]
+    if failed:
+        raise Exception(f"esync collect failed on tag(s) {sorted(failed)}")
+
+    reports = {f"Tag{tag_id}": r["report"] for tag_id, r in results.items()}
+    for tag_id, r in results.items():
+        if r["queued"].get("pending") == 0:
+            raise Exception(
+                f"Tag{tag_id}: no queued reply -- the esync window timed out "
+                f"without an edge. Check the exciter is blanking, and see "
+                f"esyncr: {r['report']}")
+    esync_mpp.check_fired(reports)
+
+    voltage_readings = {tag_id: r["trace"]
+                        for tag_id, r in results.items() if r["trace"] is not None}
+
+    return voltage_readings, mpp_start_time, mpp_stop_time, reports
+
+
 def getChannelVoltage(voltage_readings, mpp_stop_time, mpp_start_time, channels,plotting=False):
     """Segment a capture into its per-channel dwells.
 
@@ -206,14 +420,31 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                   exciter_type=None, mpp_repetitions=1, 
                   inter_MPP_batch_sleep_time=0.1,
                   channels=[1,3,4,6,7,8],
-                  exc_power=EXC_POWER):
+                  exc_power=EXC_POWER,
+                  transport=WIRED,
+                  esync_null_hold_s=esync_mpp.NULL_HOLD_S):
     global cmd_qs, result_q, processes
     
+    exc = None
     if exciter_type=='rf_gen':
         exc = Exciter()
         exc.set_freq(915)
         exc.set_pwr(exc_power)
         time.sleep(0.1)
+
+    # Over WiFi the host cannot start the tags together closely enough for a
+    # 3 ms dwell -- see esync_mpp. The exciter's blank starts them instead,
+    # so a wireless run needs one that can be fired from code.
+    #
+    # Which blank that is, is esync_mpp's business: everything this function
+    # knows is that some exciter can produce one. Hand over the resources and
+    # let the registered implementation for this EXCITER take what it needs.
+    null_exciter = None
+    if transport == WIRELESS:
+        null_exciter = esync_mpp.make_null_exciter(
+            exciter_type, hold_s=esync_null_hold_s,
+            exc=exc, run_power_dbm=exc_power)
+        print(f"Wireless run: syncing tags off a {null_exciter.describe()}")
 
     csv_path=(f"{save_path}/{exp_name}"
               f"_{freq_range[0]:g}-{freq_range[-1]:g}MHz"
@@ -236,6 +467,9 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                                 "MPP Stop Time (s)","Voltages (mV)",
                                     "Frequency (MHz)", "Run Exp Num", "MPP Repetition", "Unidirectional Phase (deg)"
                                     "Time Taken (s)"]
+        # Wireless only: how the tag saw the blank it synced off. Blank in a
+        # wired run, where nothing fires off an edge.
+        columns += ["Esync Low (us)", "Esync Returned", "Esync Long"]
         for ch in channels:
             columns.append(f"Channel_{ch}_voltages")
             columns.append(f"Channel_{ch}_median")
@@ -267,7 +501,15 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                     for rep in range(mpp_repetitions):
                         # print(f"Rep: {rep}")
                         rep_start=time.time()
-                        voltage_readings_1, mpp_start_time_1, mpp_stop_time_1=MPPMultiWays(rx_tags=rx_tags, cmdq_tx=tx_queue, result_q=result_q)
+                        esync_reports={}
+                        if transport == WIRELESS:
+                            (voltage_readings_1, mpp_start_time_1,
+                             mpp_stop_time_1, esync_reports)=MPPMultiWaysEsync(
+                                rx_tags=rx_tags, tx_tag=tx_tag,
+                                null_exciter=null_exciter, result_q=result_q)
+                            print(f"  sync: {esync_mpp.blank_summary(esync_reports)}")
+                        else:
+                            voltage_readings_1, mpp_start_time_1, mpp_stop_time_1=MPPMultiWays(rx_tags=rx_tags, cmdq_tx=tx_queue, result_q=result_q)
                         rep_end=time.time()
                         for rx_tag in rx_tags:
                             _voltages=voltage_readings_1[int(rx_tag[3:])]
@@ -297,6 +539,10 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                                 "Unidirectional Phase (deg)":phase_theta
                                 
                             }
+                            rx_report=esync_reports.get(rx_tag, {})
+                            entry["Esync Low (us)"]=rx_report.get("low_us")
+                            entry["Esync Returned"]=rx_report.get("returned")
+                            entry["Esync Long"]=rx_report.get("long")
                             for ch in channels:
                                 entry[f"Channel_{ch}_voltages"]=channels_voltages[ch].tolist()
                                 entry[f"Channel_{ch}_median"]=channel_median[ch]

@@ -30,15 +30,38 @@ class Exciter:
 
 
 class Tag:
-    def __init__(self, com_str):
+    def __init__(self, com_str=None, wifi_host=None, wifi_port=WIFI_PORT,
+                 wifi_retries=None, wifi_timeout=WIFI_TIMEOUT):
+        """
+            Either transport, or both. com_str opens the serial port as
+            before; wifi_host opens the TCP command channel instead of (or
+            as well as) it, which is what a tag reached only over the
+            network needs -- there is no serial cable to fall back to, so
+            connect() must not be on the construction path at all.
+
+            Both stay optional so the object can also be built bare and
+            connected later (connect()/connect_wifi()).
+        """
         self.com_str = com_str
         self.ser = None
         self.sock = None
         self._wifi_buf = b''
         self._wifi_host = None
         self._wifi_port = None
-        self.connect()
         self.resetTime=60 #sec
+        if com_str is not None:
+            self.connect()
+        if wifi_host is not None:
+            self.connect_wifi(wifi_host, wifi_port, timeout=wifi_timeout,
+                              retries=wifi_retries)
+
+    @classmethod
+    def over_wifi(cls, host, port=WIFI_PORT, retries=None, timeout=WIFI_TIMEOUT):
+        """
+            Convenience constructor for a tag with no serial cable attached.
+        """
+        return cls(com_str=None, wifi_host=host, wifi_port=port,
+                   wifi_retries=retries, wifi_timeout=timeout)
 
     def connect(self):
         not_connected = 1
@@ -57,12 +80,15 @@ class Tag:
                 continue
 
     def disconnect(self):
+        if self.ser is None:
+            return
         try:
             self.ser.close()
         except:
             print('error disconnecting')
 
-    def connect_wifi(self, host, port=WIFI_PORT, timeout=WIFI_TIMEOUT):
+    def connect_wifi(self, host, port=WIFI_PORT, timeout=WIFI_TIMEOUT,
+                     retries=None):
         """
             Opens a TCP connection to the tag's WiFi command port (TCP_PORT
             in the firmware), the same one `nc <ip> 3333` talks to. This is
@@ -70,35 +96,63 @@ class Tag:
             send/receive the same text commands over this raw socket
             instead of over self.ser. No makefile()/buffered-stream layer
             is used here -- just send()/recv(), like nc.
+
+            retries=None keeps the original behaviour of retrying forever,
+            which is what a worker that knows its tag is there wants. A
+            finite count is for probing an address that may be stale (a
+            recorded IP handed to some other host by DHCP): there the
+            connect failing is the answer, not something to wait out.
         """
-        not_connected = 1
-        while not_connected:
+        attempts = 0
+        while True:
             try:
                 self.sock = socket.create_connection((host, port), timeout=timeout)
                 self.sock.settimeout(0.05)
                 self._wifi_buf = b''
                 self._wifi_host = host      # remembered for reconnect_wifi()
                 self._wifi_port = port
-                not_connected = 0
+                return
             except Exception:
+                attempts += 1
+                if retries is not None and attempts >= retries:
+                    raise
                 print('couldnt connect via wifi. retrying in 1 sec')
                 time.sleep(1)
                 continue
     
-    def get_ip_port(self):
-        while True:
-            try:
-                discard_read=self.ser.readline()
-                self.ser.write(bytes("net\r\n", "UTF8"))
-                line=b''
-                while line==b'':
-                    line = self.ser.readline()
-                return json.loads(line.decode("UTF8"))
-            except Exception as e:
-                # self.disconnect()
-                raise e # raising becuase don't want to do silent fail.
+    def get_ip_port(self, timeout=5):
+        """
+            Asks the tag over serial where it is on the network. The reply is
+            {"net":"up","ip":...,"port":...,"rssi":...} once associated, and
+            {"net":"down"|"suspended"|"disabled"} otherwise.
+
+            Read through _read_json rather than a single readline(): the port
+            is opened with timeout=0, so the blob can arrive split across
+            reads and a bare readline() would hand back half a line.
+        """
+        try:
+            discard_read=self.ser.readline()
+            self.ser.write(bytes("net\r\n", "UTF8"))
+            return self._read_json(self.ser.readline, timeout, "get_ip_port")
+        except Exception as e:
+            # self.disconnect()
+            raise e # raising becuase don't want to do silent fail.
+
+    def wifi_on(self, timeout=5):
+        """
+            Brings the radio back up over serial (the firmware's wifi_on,
+            i.e. wifiResume()). Only does anything on a tag whose radio was
+            suspended -- an esync window that timed out, or an explicit
+            wifi_off. A tag built with an empty WIFI_SSID stays disabled.
+        """
+        discard_read = self.ser.readline()
+        self.ser.write(bytes("wifi_on\r\n", "UTF8"))
+        self._read_until_contains(self.ser.readline, "wifi:on", timeout,
+                                  "no valid answer timeout")
 
     def disconnect_wifi(self):
+        if self.sock is None:
+            return
         try:
             self.sock.close()
         except Exception:
@@ -269,6 +323,29 @@ class Tag:
     def queue_mpp_wifi(self, num, timeout=WIFI_TIMEOUT):
         command=f"mpp_{num}"
         self.queue_any_wifi(command, timeout)
+
+    def queue_capture(self):
+        """
+            Stages a buffered capture (rdb) to start on the next esync edge.
+
+            Unlike queue_adc_read(), the trace does NOT come back through
+            qr: rdb's own reply is just an ack, and the samples stay in the
+            tag's capture buffer until rds asks for them. That is the point
+            of using it here -- the capture runs at the full sample-loop
+            rate and is not bounded by QUEUED_REPLY_BUF_LEN, and the
+            firmware holds the radio down until captureActive() clears (see
+            loop() in the .ino) so the window covers the whole capture.
+
+            So the sequence is: queue_capture() -> esync -> reconnect ->
+            qr (the ack) -> stop_reading() (the trace).
+        """
+        self.queue_any("rdb")
+
+    def queue_capture_wifi(self, timeout=WIFI_TIMEOUT):
+        """
+            WiFi counterpart to queue_capture().
+        """
+        self.queue_any_wifi("rdb", timeout)
 
     def read_queued(self, timeout=None):
         """
