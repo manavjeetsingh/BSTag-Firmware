@@ -20,6 +20,26 @@
 #define WIFI_RETRY_MS          5000
 #define WIFI_LOW_LATENCY       1      /* 1 = disable modem sleep (more power) */
 
+/* Rejoin after an esync suspend using the channel, BSSID and address the
+ * link had before it, instead of scanning every channel and asking DHCP
+ * for a lease we already hold. A wireless run suspends and resumes once
+ * per MPP round, so the cold join is charged to every reading. Set to 0 to
+ * always rejoin the long way (see wifiResume() in net.cpp).
+ *
+ * WIFI_FAST_RESUME_MS is how long the fast path gets before net.cpp gives
+ * up on it and falls back -- long enough for a retry or two of a normal
+ * association, short enough to beat the cold join it replaces.
+ *
+ * The one thing to know: reusing the address means the tag stops renewing
+ * its DHCP lease for as long as a run keeps resuming this way. That is
+ * what the lab wants (ip-mac-mapping.json already assumes the addresses
+ * hold still for the run) but it does assume nothing else is handed the
+ * same address meanwhile. A conflict shows up as the fast path failing to
+ * associate, which falls back and logs "resume":"slow" rather than
+ * silently misbehaving. */
+#define WIFI_FAST_RESUME       1
+#define WIFI_FAST_RESUME_MS    1500
+
 /* XIAO ESP32-C6 pin mapping by physical XIAO header position. */
 #define PIN_RF_V1              20   /* D9 */
 #define PIN_RF_V2              19   /* D8 */
@@ -41,8 +61,25 @@
 #define CMD_BUF_LEN            32     /* max command length incl. terminator */
 #define OUT_CHUNK_LEN          1024   /* TX coalescing buffer, see BufferedOut */
 
-/* Buffered capture (rdb/rds). Stored as raw codes: 2 bytes/sample. */
-#define CAPTURE_BUF_LEN        10000
+/* Buffered capture (rdb/rds). Stored as raw codes: 2 bytes/sample.
+ *
+ * Sized against what the capture is for, an esync-fired MPP sweep: nine
+ * dwells of MPP_DWELL_QUEUED_US at the ~66.7 kSa/s sample loop is 1800
+ * samples (27 ms), of which mpp_segment.py measures the last six. It does
+ * not start at sample 0 -- the rx tag begins capturing at its own fire,
+ * which leads the tx tag's sweep by whatever the two detectors disagree
+ * by. Over a 2-tag wireless run that put the sweep's start at samples
+ * 807..1119 and its end at 1971..2283, so the whole thing was always over
+ * inside the first quarter of a 10000-sample buffer. 3000 covers the worst
+ * of that with ~700 samples to spare; re-measure with fit_sweep_grid()
+ * before trimming further, and raise it if the tags' fire offsets diverge
+ * (compare t_us across tags).
+ *
+ * Not free to oversize. loop() will not let wifiResume() run while the
+ * capture is still going (see the .ino), so every sample past the sweep is
+ * dead time charged to every round of the run, and it is then printed as
+ * mV over TCP and again into the run's CSV. */
+#define CAPTURE_BUF_LEN        3000
 #define CAPTURE_CHANNEL        2      /* channel forced on rdb */
 
 /* Exciter sync (esync). The exciter keys the carrier on/off through

@@ -17,6 +17,33 @@ static bool       server_started = false;
 static bool       wifi_suspended = false;
 static uint32_t   last_attempt_ms = 0;   /* last WiFi.begin(), shared with the retry timer */
 
+#if WIFI_FAST_RESUME
+/* The link as it stood before the last suspend, so the resume can skip the
+ * parts of a cold join that only exist to discover things we already know:
+ * the scan across every channel (we have the AP's channel and BSSID) and
+ * the DHCP exchange (we have the lease). Together those are the bulk of a
+ * join, and an esync run pays a join on every single round.
+ *
+ * Only ever an optimisation: serviceWifi() below gives the fast path
+ * WIFI_FAST_RESUME_MS and then falls back to the cold one, so an AP that
+ * moved channel or a lease that went elsewhere costs one slow resume and a
+ * "resume":"slow" notice on Serial, not a tag that never comes back. */
+static bool       fast_valid = false;    /* the cached link below is usable */
+static bool       fast_pending = false;  /* a fast resume is in flight */
+static uint8_t    fast_bssid[6];
+static int32_t    fast_channel = 0;
+static IPAddress  fast_ip, fast_gw, fast_mask, fast_dns;
+
+static void clearStaticIp(void)
+{
+    /* 0.0.0.0 as the local address is how the ESP32 WiFi class is told to
+     * go back to DHCP; without this a failed fast resume would retry the
+     * cold path still pinned to a lease that may be the reason it failed. */
+    WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0),
+                IPAddress((uint32_t)0));
+}
+#endif
+
 void wifiStart(void)
 {
     if (strlen(WIFI_SSID) == 0) {
@@ -44,6 +71,26 @@ void wifiSuspend(void)
         return;
     }
 
+#if WIFI_FAST_RESUME
+    /* Snapshot before the teardown, while these still read back. Gated on
+     * wifi_up: a suspend entered while the link was already down would
+     * otherwise cache a half-formed association and send the next resume
+     * chasing it. */
+    if (wifi_up) {
+        const uint8_t *bssid = WiFi.BSSID();
+        if (bssid != NULL) {
+            memcpy(fast_bssid, bssid, sizeof(fast_bssid));
+            fast_channel = WiFi.channel();
+            fast_ip      = WiFi.localIP();
+            fast_gw      = WiFi.gatewayIP();
+            fast_mask    = WiFi.subnetMask();
+            fast_dns     = WiFi.dnsIP();
+            fast_valid   = (fast_channel > 0 &&
+                            !(fast_ip == IPAddress((uint32_t)0)));
+        }
+    }
+#endif
+
     for (int i = 0; i < MAX_TCP_CLIENTS; i++) {
         tcp_clients[i].stop();
         sessionClose(i + 1);
@@ -68,6 +115,21 @@ void wifiResume(void)
 
     wifi_suspended = false;
     WiFi.mode(WIFI_STA);
+
+#if WIFI_FAST_RESUME
+    if (fast_valid) {
+        /* Straight back to the same AP on the same channel with the same
+         * address: no scan, no DHCP. serviceWifi() restarts the server as
+         * usual, and watches the clock in case this does not take. */
+        WiFi.config(fast_ip, fast_gw, fast_mask, fast_dns);
+        WiFi.begin(WIFI_SSID, WIFI_PASS, fast_channel, fast_bssid);
+        fast_pending = true;
+        last_attempt_ms = millis();
+        return;
+    }
+    fast_pending = false;
+#endif
+
     WiFi.begin(WIFI_SSID, WIFI_PASS);   /* serviceWifi() restarts the server */
     last_attempt_ms = millis();         /* don't let the retry timer double this up */
 }
@@ -84,6 +146,28 @@ void serviceWifi(void)
     }
 
     bool connected = (WiFi.status() == WL_CONNECTED);
+
+#if WIFI_FAST_RESUME
+    /* A fast resume that has not associated by now is chasing something
+     * that changed under us -- the AP moved channel or band, or the lease
+     * went to someone else. Drop the cache and rejoin the long way; the
+     * next suspend re-learns it. */
+    if (fast_pending) {
+        if (connected) {
+            fast_pending = false;
+        } else if (millis() - last_attempt_ms >= WIFI_FAST_RESUME_MS) {
+            fast_pending = false;
+            fast_valid = false;
+            WiFi.disconnect(false);
+            clearStaticIp();
+            WiFi.begin(WIFI_SSID, WIFI_PASS);
+            last_attempt_ms = millis();
+            Serial.println("{\"info\":\"wifi\",\"resume\":\"slow\","
+                           "\"reason\":\"fast path did not associate\"}");
+            return;
+        }
+    }
+#endif
 
     if (connected && !wifi_up) {
         wifi_up = true;
