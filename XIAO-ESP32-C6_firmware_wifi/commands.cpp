@@ -91,11 +91,11 @@ void printHelp(Print &out)
     out.println("  rds          stop capture and dump buffer");
     out.println("  spl          start plotter stream on ch 2 (mV,d0_level)");
     out.println("  epl          stop plotter stream");
-    out.println("  esync        listen for exciter sync");
+    out.println("  esync        listen for exciter sync (ASK preamble)");
     out.println("  esyncs       stop listening for exciter sync");
-    out.println("  esyncr       report the last exciter sync edge");
+    out.println("  esyncr       report the last exciter sync lock");
     out.println("  qr           reply the queued command left behind");
-    out.println("  q_<cmd>      queue <cmd>, run it on the next esync edge");
+    out.println("  q_<cmd>      queue <cmd>, run it on the next esync lock");
     out.println("  q            show the queued command");
     out.println("  qc           clear the queued command");
     out.println("  mpp          one MPP channel sweep");
@@ -287,7 +287,7 @@ void handleCommand(char *command, Print &out, int session_idx, bool from_queue)
     }
 
     /* Reply the queued command produced while the radio was down, and the
-     * edge that triggered it. Both survive until the next esync arms. */
+     * lock that triggered it. Both survive until the next esync arms. */
     if (strcmp(command, "qr") == 0) {
         dumpQueuedReply(out);
         return;

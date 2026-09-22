@@ -1,7 +1,6 @@
 {
     "CONNECTION": "wireless",
-    "ESYNC_NULL_HOLD_S": 0.05,
-    "EXCITER": "rf_gen",
+    "EXCITER": "bladerf",
     "EXC_POWER": 12.9,
     "MPP_REPETITIONS": 1,
     "FREQ_MIN": 895,

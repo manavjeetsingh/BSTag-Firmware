@@ -45,134 +45,52 @@
 #define CAPTURE_BUF_LEN        10000
 #define CAPTURE_CHANNEL        2      /* channel forced on rdb */
 
-/* Exciter sync (esync). Moving window of raw codes: 2 bytes/sample.
+/* Exciter sync (esync). The exciter keys the carrier on/off through
+ * ESYNC_CODE, one chip per ESYNC_CHIP_US
+ * (BladeRFCode/ASK_sync/manual_ask_sync_exciter.py), and the tag
+ * correlates the whole preamble against the code instead of testing single
+ * samples against a floor:
  *
- * The exciter sends one blank of a known length. The tag times off the
- * FALLING edge that starts it and fires ESYNC_FIRE_DELAY_US later, which
- * lands on the far side of the blank without needing to see the rise:
+ *      idle  [1 1 1 1 1 0 0 1 1 0 1 0 1]  idle
+ *      ────┐ ┌───────┐   ┌──┐ ┌┐ ┌──────────
+ *          └─┘       └───┘  └─┘└─┘
+ *                                  ^<- FIRE_DELAY ->^
+ *                          correlation peak     fires here
  *
- *      idle        blank        idle
- *      ────┐                 ┌────────
- *          └─────────────────┘
- *          ^<-- FIRE_DELAY -->^
- *      t_fall              fires here
+ * Samples are averaged into ESYNC_BIN_US time bins first, so the
+ * correlator works on a uniform time grid however unevenly loop() runs.
+ * The score is the Pearson correlation of the last preamble's worth of
+ * bins against the mean-removed code: it depends on the signal's shape and
+ * not its level, so the same threshold serves a 10 mV tag and a 500 mV
+ * one, and a steady offset or interferer cancels out.
  *
- * Timing off the fall rather than the rise costs the length test, and
- * that is the whole trade. Firing on the rise meant the blank's length
- * was already known when the edge arrived, so a fade could be rejected
- * for free. Committing on the fall means committing before the length is
- * known, so a blank that runs LONG -- an outage, or an ESYNC_TIME_SCALE
- * mismatch with the exciter -- can no longer be rejected: the tag has
- * already fired by the time that shows. What survives is the one thing
- * decidable inside the delay window: a blank that ends before
- * ESYNC_BLANK_MIN_US (rej_short) is thrown away without firing. The
- * measured length is reported afterwards by esyncr so a bad sync is
- * still diagnosable after the fact.
+ * The timing reference is the correlation peak -- the instant the window
+ * lined up with the end of the preamble -- interpolated between bins. It
+ * sits a fixed few hundred us after the true end, set by the detector's
+ * time constant: shared by tags with the same front end, not by tags
+ * without one.
  *
- * The falling edge is the timing reference, and it is simply the first
- * sample at or under ESYNC_MIN_BASELINE_MV. The exciter drives the
- * carrier to the floor every time, so that single absolute test does
- * double duty: it is the timing reference AND the proof the blank is
- * real, since a sag that never reaches the floor never latches an edge.
- *
- * Judging the fall against a fraction of baseline instead would zero the
- * spread between tags receiving different amplitudes, but that spread is
- * already a fraction of a percent of the fall time -- under a
- * microsecond, against a sample period of tens -- so it would buy nothing
- * measurable while making the timing reference depend on the tracked
- * baseline being right. The baseline is still used for the RETURN, which
- * is not timing-critical; it only follows the signal while it is at rest,
- * so a blank cannot drag it down however long it lasts.
- *
- * Mirrored in BladeRFCode/null_sync/manual_null_exciter.py; the blank
- * length has to be edited in both places at once. */
-#define ESYNC_BUF_LEN          10000
+ * A mismatch with the exciter fails safe: a wrong chip length or code does
+ * not fire at the wrong time, it just never correlates. ESYNC_CHIP_US and
+ * ESYNC_CODE must still match CHIP_MS and BARKER_CODE in the exciter. */
 #define ESYNC_CHANNEL          2      /* RX channel forced on esync */
-#define ESYNC_WARMUP_SAMPLES   1000   /* samples used to seed the baseline */
-#define ESYNC_MIN_BASELINE_MV  2.0f   /* floor level: at or under this is a drop,
-                                        and the falling edge the tag times
-                                        off. Measured blanks bottom out around
-                                        0.8 mV, so this clears the floor with
-                                        room to spare while staying far below
-                                        any real carrier. */
-#define ESYNC_REARM_PCT        50     /* % below baseline that counts as back
-                                        up. Used for the RISE only -- the fall
-                                        is the absolute floor test above. This
-                                        is hysteresis, not a timing reference:
-                                        it only has to sit far enough above
-                                        the floor that the state machine
-                                        cannot rattle, so the exact value is
-                                        not critical. Needs a baseline above
-                                        2*ESYNC_MIN_BASELINE_MV to stay clear
-                                        of the floor. */
-#define ESYNC_BASELINE_SHIFT   10     /* baseline IIR time constant, 1<<n samples */
+#define ESYNC_CODE             { 1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1 }
+#define ESYNC_CHIP_US          2000   /* == CHIP_MS in the exciter */
+#define ESYNC_BIN_US           100    /* must divide ESYNC_CHIP_US */
+#define ESYNC_MIN_RHO          0.80f  /* correlation needed to lock, 0..1. Lower
+                                         finds weaker preambles and is fooled
+                                         more easily by on/off traffic near the
+                                         chip rate; 0.85 stops that but loses
+                                         ~5 mV preambles. */
+#define ESYNC_MIN_SWING_MV     1.0f   /* on-minus-off needed to lock. A floor
+                                         under the correlation, not the test:
+                                         it only stops a flat carrier's noise
+                                         from locking, and sits 10x under the
+                                         weakest tag this is meant for. */
+#define ESYNC_CONFIRM_US       1000   /* a peak must stay the best this long */
+#define ESYNC_FIRE_DELAY_US    5000   /* fire this long after the peak */
 #define ESYNC_WIFI_QUIET_MS    50     /* ack drain before the radio goes down */
-#define ESYNC_WIFI_TIMEOUT_MS  30000  /* no packet by now: bring the radio back */
-
-/* Time scale, multiplying the blank length below. MUST equal N in
- * manual_null_exciter.py, with the tag reflashed to match: the detector
- * works in absolute microseconds and cannot infer the scale off the air.
- *
- * Timing off the fall makes a mismatch here worse than it used to be, and
- * worth re-checking whenever either side moves. It no longer merely stops
- * the tag firing: ESYNC_FIRE_DELAY_US scales with this, so a tag flashed
- * for the wrong N still fires, just at the wrong moment -- early if this
- * is low, out past the end of the blank if it is high. Confirm it against
- * esyncr's low_us, which reports what the blank actually measured.
- *
- * The exciter's ramp is deliberately not scaled with this. The tag
- * latches the fall when the signal reaches the floor, so a longer ramp
- * simply moves t_fall later by roughly the ramp length and drags every
- * tag's fire with it. Keep the edges sharp and the offset stays small. */
-#define ESYNC_TIME_SCALE           1
-
-/* When the queued command fires, measured from the falling edge. This is
- * the blank's nominal length, so the command lands as the carrier comes
- * back -- the same instant the old rising-edge detector fired on, reached
- * by dead reckoning instead of by watching for the rise.
- *
- * MUST match DROP_MS in manual_null_exciter.py. Nothing on the air can
- * check this for you: the tag commits to the delay at the falling edge,
- * so an exciter sending a different length is not detected, it is just
- * fired against at the wrong time.
- *
- * esyncr's low_us is the check, but read it as an approximation rather
- * than an equality. It is measured between two different thresholds --
- * from the floor on the way down to ESYNC_REARM_PCT on the way up -- so
- * it under-reads DROP_MS by about the fall time plus half the rise, a
- * millisecond or two in practice. What matters is that it is STABLE and
- * agrees across tags. A drift of many ms, or tags disagreeing, is the
- * mismatch this constant cannot otherwise reveal. */
-#define ESYNC_FIRE_DELAY_US    ( 50000 * ESYNC_TIME_SCALE)
-
-/* The expected blank length. These two no longer play the same role as
- * each other, which is the visible cost of timing off the fall.
- *
- * MIN is still a gate, and still the main thing separating a deliberate
- * blank from a fade. A blank that ends before it has fired nothing: the
- * carrier came back inside the delay window, which the tag can see and
- * act on while it still has the choice.
- *
- * MAX is no longer a gate. The tag has already fired by the time a blank
- * overruns it, so this only decides when esyncr calls the blank it fired
- * against a long one. It costs nothing to keep and it is the one warning
- * that an outage or a scale mismatch was synced against, so leave it at
- * whatever the exciter should not exceed.
- *
- * Kept wide enough that every exciter in BladeRFCode is accepted:
- * null_sync/manual_null_exciter.py sends 50 ms, and the old 40 ms blank
- * still works. Narrow MIN toward whatever your exciter actually sends
- * only if tags start firing on things that are not it -- and check
- * esyncr's rej_short first, since a MIN that is too tight looks exactly
- * like a tag that cannot hear the exciter.
- *
- * Note periodic_null_exciter.py's 2000 ms blank is outside this on
- * purpose. That one is now a genuine hazard rather than merely an
- * unsupported exciter: a 2 s blank still trips the falling edge and
- * still fires ESYNC_FIRE_DELAY_US later, 1.95 s before the carrier is
- * back, and only esyncr's long flag afterwards says so. */
-#define ESYNC_BLANK_MIN_US     ( 10000 * ESYNC_TIME_SCALE)
-#define ESYNC_BLANK_MAX_US     (120000 * ESYNC_TIME_SCALE)
+#define ESYNC_WIFI_TIMEOUT_MS  30000  /* no preamble by now: bring the radio back */
 
 /* Deferred reply. The queued command fires while the radio is down, so
  * its reply is captured here and handed over with qr after the host

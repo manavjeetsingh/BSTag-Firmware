@@ -5,7 +5,7 @@
 /*   secrets.h       WiFi credentials (gitignored)                     */
 /*   hardware.*      power rail, LEDs, RF switch, ADC over SPI         */
 /*   acquisition.*   buffered capture, plotter stream, MPP sweep       */
-/*   esync.*         exciter sync listener and edge detector           */
+/*   esync.*         exciter sync listener, ASK preamble correlator    */
 /*   commands.*      the text protocol, transport agnostic             */
 /*   session.*       per-transport line assembly and dispatch          */
 /*   net.*           WiFi link and the TCP command server              */

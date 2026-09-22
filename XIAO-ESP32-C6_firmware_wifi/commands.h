@@ -14,7 +14,7 @@ void handleCommand(char *command, Print &out, int session_idx,
 
 /* ------------------------------------------------------------------ */
 /* Deferred command. One slot, staged with q_<cmd> and fired by the    */
-/* esync detector on the next rising edge.                             */
+/* esync detector on the next preamble lock.                           */
 /* ------------------------------------------------------------------ */
 
 /* Stage a command. `session_idx` is where its output goes when it runs;
@@ -32,7 +32,7 @@ void runQueuedCommand(void);
 /* Deferred reply.                                                     */
 /*                                                                     */
 /* The esync window runs with the radio off, so the session that staged */
-/* the command is gone by the time the edge fires. Rather than drop the */
+/* the command is gone by the time the lock fires. Rather than drop the */
 /* reply on a dead socket, it is captured in RAM and handed over with   */
 /* qr once the host reconnects -- the same pull pattern as rdb/rds.     */
 /* Reads are non-destructive; esyncListen() clears it for the next run. */

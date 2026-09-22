@@ -1,13 +1,9 @@
-import serial
 import pandas as pd
 from ribbn_scripts.hardware_api.hardware import Tag
 import numpy as np
 import time
-import pickle
 import os
-import numpy as np
 import matplotlib.pyplot as plt
-import os
 import multiprocessing
 import queue as queue_mod
 from ribbn_scripts.processing.phase_cal import cal_theta
@@ -60,9 +56,8 @@ def tag_ops(tag_instance, transport):
             "get_adc_val": tag_instance.get_adc_val_wifi,
             "reflect": tag_instance.reflect_wifi,
             "disconnect": tag_instance.disconnect_wifi,
-            # esync: staged here, fired by the exciter's blank, collected
-            # after the radio comes back. Wireless only -- over serial there
-            # is no radio to suspend and the wired timing is good enough.
+            # esync: staged here, fired by the exciter's preamble, collected
+            # once the radio is back. Wired runs don't need it.
             "stage_mpp": lambda: tag_instance.queue_mpp_wifi(1),
             "stage_capture": tag_instance.queue_capture_wifi,
             "arm_esync": tag_instance.listen_esync_wifi,
@@ -82,21 +77,9 @@ def tag_ops(tag_instance, transport):
 
 
 def _reset_esync(tag_instance):
-    """Put a tag back to no-esync-state: not listening, nothing staged.
-
-    Both halves of an esync round are sticky across host restarts, and
-    neither is cleared by connecting. A run that died between `esync` and
-    the edge leaves the detector armed -- the firmware brings its radio
-    back after ESYNC_WIFI_TIMEOUT_MS but goes on listening -- and a q_
-    that never fired stays staged forever. Inherited, the two combine
-    badly: the next round's first blank fires the PREVIOUS run's command,
-    on a detector this run never armed.
-
-    Order matters. Disarm before clearing the queue: clearing first leaves
-    a live detector that could fire on a blank in between, and while the
-    staged slot would be empty by then, runQueuedCommand() would still
-    have consumed the arming this run is about to rely on.
-    """
+    """Disarm and clear the staged command, left over from a run that died
+    mid-round -- or the next round fires the previous run's command.
+    Disarm first, so a sync can't fire the slot in between."""
     tag_instance.stop_esync_wifi()
     tag_instance.clear_queued_command_wifi()
 
@@ -104,23 +87,12 @@ def _reset_esync(tag_instance):
 def _collect_esync(tag_instance, want_trace):
     """Pick up what a tag did while its radio was down.
 
-    Runs inside the worker process, after the blank. reconnect_wifi() IS
-    the wait: the listener only comes back once the firmware resumes, and
-    the firmware holds the resume until the queued capture has finished
-    (loop() in the .ino gates it on captureActive()). So by the time this
-    connects, an Rx tag's 10000 samples are already sitting in the capture
-    buffer, and rds just hands them over on the live socket.
-
-    That is why the Rx tags queue rdb rather than adc_<n>: the trace does
-    not have to fit QUEUED_REPLY_BUF_LEN, it comes back at the full sample
-    rate, and it is shaped exactly like a wired capture -- so
-    getChannelVoltage() and cal_theta() below need no wireless variant.
+    Reconnecting is the wait: the firmware keeps WiFi down until the queued
+    capture is done. Rx tags staged rdb, whose qr ack is the plain line
+    "rdb"; the trace then comes over the live socket with rds, shaped exactly
+    like a wired capture.
     """
     tag_instance.reconnect_wifi(deadline_s=esync_mpp.RECONNECT_DEADLINE_S)
-    # want_trace says which command was staged, and that decides how qr
-    # answers: an Rx tag staged rdb, whose reply is the plain line "rdb"
-    # rather than a JSON blob, so qr has to be told what ack to expect. The
-    # Tx tag staged mpp_1 and answers in JSON like everything else.
     queued = tag_instance.fetch_queued_wifi(ack="rdb" if want_trace else None)
     report = tag_instance.esync_report_wifi()
     trace = tag_instance.stop_reading_wifi() if want_trace else None
@@ -175,9 +147,7 @@ def device_worker(endpoint, tag_id, command_queue, result_queue, transport=WIRED
                 ops["arm_esync"]()
                 result_queue.put((tag_id, "esync_armed", True))
             elif command == "esync_reset":
-                # Bound on the wireless transport only -- a wired run never
-                # arms a detector, so there is nothing to put back. Answer
-                # either way so the barrier completes for mixed setups.
+                # Wireless only; answer either way so the barrier completes.
                 reset = ops.get("reset_esync")
                 if reset is not None:
                     reset()
@@ -259,36 +229,6 @@ def initialize(tag_endpoint_mapping, transport=WIRED):
         p.start()
     
 
-def MPP(cmdq_rx,cmdq_tx, result_q):
-    """
-        @args: Tx, Rx: Tag type objects.
-    
-        - Set Rx to receiving state.
-        - Go through all phases of Tx (includes non-reflecting (ch5) and receiving (ch2), for completeness.
-        
-        @returns a dictionary of "phase":"voltage at Rx" mappings.
-    """
-
-    cmdq_rx.put("begin_reading")
-    cmdq_tx.put("perform_mpp")
-    mpp_done = False
-    mpp_start_time=None
-    mpp_stop_time=None
-    while not mpp_done:
-        tag_id, res_type, data = result_q.get()
-        if res_type == "mpp_times":
-            mpp_start_time, mpp_stop_time = data
-            mpp_done = True
-    cmdq_rx.put("stop_reading")
-    voltage_readings = None
-    while voltage_readings is None:
-        tag_id, res_type, data = result_q.get()
-        if res_type == "voltage_readings":
-            voltage_readings = data
-
-    return voltage_readings, mpp_start_time, mpp_stop_time
-
-
 def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
     global cmd_qs
 
@@ -318,13 +258,8 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
 def _gather(result_q, res_type, tags, timeout):
     """Block until every tag in `tags` has answered with `res_type`.
 
-    The barrier the esync sequence is built out of: nothing may be sent to
-    the exciter until every tag has acked its arm, or the ones still
-    talking miss the edge. Results of other types are stale answers from an
-    abandoned round and are dropped.
-
-    A worker that raised puts None (see device_worker), which arrives here
-    as a normal answer and is reported by the caller rather than hanging.
+    Answers of other types are stale ones from an abandoned round and are
+    dropped. A worker that raised answers None (see device_worker).
     """
     want = {int(t[3:]) for t in tags}
     got = {}
@@ -345,199 +280,77 @@ def _gather(result_q, res_type, tags, timeout):
     return got
 
 
-def MPPMultiWaysEsync(rx_tags, tx_tag, null_exciter, result_q,
-                      channels_settle_s=RX_SETTLE_S,
-                      max_attempts=None):
-    """One MPP round with every tag started by the exciter, not by the host.
+def MPPMultiWaysEsync(rx_tags, tx_tag, exc, result_q):
+    """One MPP round started by the exciter's preamble instead of the host.
 
-    Re-shoots the round on ANY failure, and returns the first shot every
-    tag survived. See _esyncRound() for the sequence itself.
-
-    Nothing from a failed round is salvaged. A blind fire ("returned":0)
-    means the tag swept while the carrier was still down, so its trace is
-    of an unlit scene -- keeping it would quietly poison the phase
-    estimate rather than just making it noisier -- and a round that
-    errored anywhere else has no complete set of traces to keep in the
-    first place. So the whole round is thrown away and shot again from
-    staging.
-
-    Re-staging is safe from any of these failure points. The workers
-    survive their own exceptions (device_worker catches per command), the
-    firmware's esyncListen() resets the detector and clears the stale
-    queued reply, and queueCommand() overwrites rather than appends. What
-    does NOT clean itself up is result_q: a _gather() that timed out
-    leaves the late answers behind, and they are indistinguishable from
-    fresh ones on the next attempt. Hence the drain below.
-
-    Retrying assumes the failure is a race that another shot can win. Some
-    are not -- a tag whose base_mv sits under ESYNC_MIN_BASELINE_MV is not
-    receiving enough carrier to detect an edge at all, and will report
-    "pending":0 identically on every attempt. The cap is what stops those
-    from spinning: exhausting it is the signal that the problem is the
-    setup, not the shot.
+    Any failure drops the whole round and re-shoots it, up to
+    MAX_ROUND_ATTEMPTS; nothing from a failed shot is kept. Leftover answers
+    from the failed shot are drained first, or the next _gather() would read
+    them as its own.
     """
-    if max_attempts is None:
-        max_attempts = esync_mpp.MAX_ROUND_ATTEMPTS
-
     last = None
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, esync_mpp.MAX_ROUND_ATTEMPTS + 1):
         if attempt > 1:
-            # Whatever the last attempt was still waiting on may land now.
-            # _gather() matches on type and tag id, not on which round asked,
-            # so a leftover answer would be read as this attempt's -- pairing
-            # one round's traces with another's esyncr report.
-            dropped = _drainResults(result_q)
-            if dropped:
-                print(f"  sync: dropped {dropped} stale result(s) from the "
-                      f"abandoned attempt")
-
+            _drainResults(result_q)
         try:
-            return _esyncRound(rx_tags, tx_tag, null_exciter, result_q,
-                               channels_settle_s)
-        except esync_mpp.BlindFire as e:
-            last = e
-            print(f"  sync: attempt {attempt}/{max_attempts} fired blind, "
-                  f"dropping this round and re-shooting: {e}")
+            return _esyncRound(rx_tags, tx_tag, exc, result_q)
         except Exception as e:
             last = e
-            print(f"  sync: attempt {attempt}/{max_attempts} failed, "
-                  f"dropping this round and re-shooting: {e}")
-
-    if isinstance(last, esync_mpp.BlindFire):
-        raise Exception(
-            f"esync fired blind on all {max_attempts} attempts, so no usable "
-            f"round was collected. This is no longer a race being lost "
-            f"occasionally -- the blank is longer than the tags' "
-            f"ESYNC_FIRE_DELAY_US ({esync_mpp.ESYNC_FIRE_DELAY_US} us) every "
-            f"time. Lower ESYNC_NULL_HOLD_S in configurations.json (currently "
-            f"{null_exciter.hold_s:g} s). Last: {last}")
+            print(f"  sync: attempt {attempt}/{esync_mpp.MAX_ROUND_ATTEMPTS} "
+                  f"failed, re-shooting: {e}")
 
     raise Exception(
-        f"esync round failed on all {max_attempts} attempts, so no usable "
-        f"round was collected. A failure that repeats this consistently is "
-        f"the setup rather than the shot -- check the esyncr line in the "
-        f"error below. base_mv under ESYNC_MIN_BASELINE_MV "
-        f"({esync_mpp.ESYNC_MIN_BASELINE_MV} mV) means that tag is not lit "
-        f"brightly enough to detect an edge at all, and no retry fixes it. "
-        f"Last: {last}")
+        f"esync round failed on all {esync_mpp.MAX_ROUND_ATTEMPTS} attempts. "
+        f"A failure this consistent is the setup, not the shot -- see peak_rho "
+        f"in esync_mpp.check_fired(). Last: {last}")
 
 
 def _drainResults(result_q):
-    """Empty result_q of answers left over from an abandoned attempt.
-
-    Returns how many were discarded, so a round that keeps tripping over
-    late arrivals says so instead of silently pairing them up wrong.
-    """
-    dropped = 0
     while True:
         try:
             result_q.get_nowait()
-        except queue_mod.Empty:
-            return dropped
         except Exception:
-            # Some queue backends raise their own flavour of empty; treat
-            # anything unreadable as drained rather than failing the retry.
-            return dropped
-        dropped += 1
+            return
 
 
-def _esyncRound(rx_tags, tx_tag, null_exciter, result_q,
-                channels_settle_s=RX_SETTLE_S):
-    """One shot at an MPP round, started by the exciter rather than the host.
+def _esyncRound(rx_tags, tx_tag, exc, result_q):
+    """One shot: stage, arm, sync, collect.
 
-    The wireless counterpart to MPPMultiWays(). Same inputs and same shape
-    of output, so mainMultiWays() can swap one for the other, but the host
-    never tells a tag "go" -- it stages the work, steps out of the timing
-    path while the radios sleep, and blanks the carrier once. Every tag
-    fires off that one shared edge.
-
-    Order matters at two points:
-
-      - Everything is staged BEFORE any tag is armed. `esync` makes the
-        firmware suspend the radio within ESYNC_WIFI_QUIET_MS of acking,
-        so a q_ sent to an armed tag never lands.
-
-      - The blank comes only after every tag has acked its arm, plus
-        ARM_SETTLE_S for the radios to actually go down and the detectors
-        to seed their baselines. Fire early and the late tags miss the
-        edge entirely.
-
-    Raises esync_mpp.BlindFire if the shot landed mid-blank, which the
-    caller retries; every other failure here aborts the run.
+    Everything is staged before anything is armed, because `esync` takes the
+    radio down ESYNC_WIFI_QUIET_MS after acking and a later q_ never lands.
     """
-    global cmd_qs
-
     all_tags = [tx_tag] + list(rx_tags)
 
-    # 1. Stage. Rx tags capture (rdb), the Tx tag sweeps (mpp_1).
     cmd_qs[tx_tag].put("esync_stage_mpp")
     for rx_tag in rx_tags:
         cmd_qs[rx_tag].put("esync_stage_capture")
     _gather(result_q, "esync_staged", all_tags, timeout=30)
 
-    # 2. Arm. From here the radios are going down; nothing more can be sent.
     for tag in all_tags:
         cmd_qs[tag].put("esync_arm")
     _gather(result_q, "esync_armed", all_tags, timeout=30)
 
-    # 3. Let the radios actually go down before anything else happens.
-    #
-    #    This wait is load-bearing twice over, and both failures are quiet.
-    #    The detector needs carrier to seed its baseline before a drop means
-    #    anything, so firing early means tags that never see the edge. And
-    #    the firmware only suspends ESYNC_WIFI_QUIET_MS after acking, so a
-    #    collect dispatched inside that gap finds the OLD socket still open,
-    #    reconnect_wifi() returns immediately on a connection that is about
-    #    to be dropped, and qr is read before the tag has fired.
+    # Radios down and correlators primed before the preamble -- and before the
+    # collects start, or they reconnect to the old socket before it closes.
     time.sleep(esync_mpp.ARM_SETTLE_S)
 
-    # 4. Now the workers can start waiting. With the radios down the
-    #    reconnect can only succeed once the firmware resumes, which is what
-    #    makes retrying it the readiness check.
     cmd_qs[tx_tag].put("esync_collect_tx")
     for rx_tag in rx_tags:
         cmd_qs[rx_tag].put("esync_collect_rx")
 
-    # 5. The shot.
-    mpp_start_time, mpp_stop_time = null_exciter.fire()
+    mpp_start_time, mpp_stop_time = exc.sync()
 
-    # 6. Pick up the pieces once every radio is back.
     results = _gather(result_q, "esync_result", all_tags,
                       timeout=esync_mpp.RECONNECT_DEADLINE_S + 60)
-
     failed = [t for t, r in results.items() if r is None]
     if failed:
         raise Exception(f"esync collect failed on tag(s) {sorted(failed)}")
 
     reports = {f"Tag{tag_id}": r["report"] for tag_id, r in results.items()}
-
-    # A tag too dimly lit to detect an edge reports exactly like a tag that
-    # never saw one, so name it before the generic message sends the
-    # operator looking at the exciter's blank instead of its power.
-    stalled = esync_mpp.stalled_tags(reports)
-
-    for tag_id, r in results.items():
-        if r["queued"].get("pending") == 0:
-            name = f"Tag{tag_id}"
-            if name in stalled:
-                raise Exception(
-                    f"{name}: no queued reply, and its carrier is too weak "
-                    f"for the detector to work: base_mv={stalled[name]} is "
-                    f"at or under {esync_mpp.ESYNC_MIN_BASELINE_MV} mV / "
-                    f"(1 - {esync_mpp.ESYNC_REARM_PCT}%), so the return "
-                    f"threshold has crossed under the floor and esync bails "
-                    f"out before ever testing for an edge. The blank is not "
-                    f"the problem -- this tag needs more carrier (exciter "
-                    f"power, or move/re-aim the tag). esyncr: {r['report']}")
-            raise Exception(
-                f"{name}: no queued reply -- the esync window timed out "
-                f"without an edge. Check the exciter is blanking, and see "
-                f"esyncr: {r['report']}")
     esync_mpp.check_fired(reports)
 
     voltage_readings = {tag_id: r["trace"]
                         for tag_id, r in results.items() if r["trace"] is not None}
-
     return voltage_readings, mpp_start_time, mpp_stop_time, reports
 
 
@@ -575,42 +388,24 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                   channels=[1,3,4,6,7,8],
                   exc_power=EXC_POWER,
                   transport=WIRED,
-                  esync_null_hold_s=esync_mpp.NULL_HOLD_S,
                   exciter_settings=None):
     global cmd_qs, result_q, processes
 
-    # Whichever exciter EXCITER names -- see exciters.py. Everything below
-    # asks it for a frequency and a level and does not care which one it is.
-    # Normalized here as well as in collection.py because the notebooks in
-    # Testing/ call this directly, and esync_mpp's registry below is keyed
-    # on the same normalized name.
     exciter_type = exciters.normalize(exciter_type)
     exc = exciters.make_exciter(exciter_type, **(exciter_settings or {}))
+    if transport == WIRELESS and not hasattr(exc, "sync"):
+        # Over WiFi the host can't start the tags together within a 3 ms
+        # dwell; the exciter's ASK preamble does, and only the bladeRF can
+        # key one.
+        exciters.shutdown(exc)
+        raise Exception(
+            f"a wireless run is synced by the exciter's ASK preamble, which "
+            f"EXCITER={exciter_type!r} cannot send. Set EXCITER to \"bladerf\" "
+            f"(and EXC_POWER to a gain, ~60), or run CONNECTION: wired.")
     if exc is not None:
         exc.set_freq(915)
         exc.set_pwr(exc_power)
         time.sleep(0.1)
-
-    # Over WiFi the host cannot start the tags together closely enough for a
-    # 3 ms dwell -- see esync_mpp. The exciter's blank starts them instead,
-    # so a wireless run needs one that can be fired from code.
-    #
-    # Which blank that is, is esync_mpp's business: everything this function
-    # knows is that some exciter can produce one. Hand over the resources and
-    # let the registered implementation for this EXCITER take what it needs.
-    null_exciter = None
-    if transport == WIRELESS:
-        try:
-            null_exciter = esync_mpp.make_null_exciter(
-                exciter_type, hold_s=esync_null_hold_s,
-                exc=exc, run_power=exc_power)
-        except Exception:
-            # This refuses on a whole class of misconfiguration (an EXCITER
-            # that cannot blank, a hold length the tags would reject), so
-            # put the carrier down rather than leave it lit on the way out.
-            exciters.shutdown(exc)
-            raise
-        print(f"Wireless run: syncing tags off a {null_exciter.describe()}")
 
     csv_path=(f"{save_path}/{exp_name}"
               f"_{freq_range[0]:g}-{freq_range[-1]:g}MHz"
@@ -633,9 +428,8 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                                 "MPP Stop Time (s)","Voltages (mV)",
                                     "Frequency (MHz)", "Run Exp Num", "MPP Repetition", "Unidirectional Phase (deg)"
                                     "Time Taken (s)"]
-        # Wireless only: how the tag saw the blank it synced off. Blank in a
-        # wired run, where nothing fires off an edge.
-        columns += ["Esync Low (us)", "Esync Returned", "Esync Long"]
+        # Wireless only: how well each tag locked on the preamble.
+        columns += ["Esync Rho", "Esync SNR (dB)"]
         for ch in channels:
             columns.append(f"Channel_{ch}_voltages")
             columns.append(f"Channel_{ch}_median")
@@ -672,8 +466,8 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                             (voltage_readings_1, mpp_start_time_1,
                              mpp_stop_time_1, esync_reports)=MPPMultiWaysEsync(
                                 rx_tags=rx_tags, tx_tag=tx_tag,
-                                null_exciter=null_exciter, result_q=result_q)
-                            print(f"  sync: {esync_mpp.blank_summary(esync_reports)}")
+                                exc=exc, result_q=result_q)
+                            print(f"  sync: {esync_mpp.sync_summary(esync_reports)}")
                         else:
                             voltage_readings_1, mpp_start_time_1, mpp_stop_time_1=MPPMultiWays(rx_tags=rx_tags, cmdq_tx=tx_queue, result_q=result_q)
                         rep_end=time.time()
@@ -706,9 +500,8 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                                 
                             }
                             rx_report=esync_reports.get(rx_tag, {})
-                            entry["Esync Low (us)"]=rx_report.get("low_us")
-                            entry["Esync Returned"]=rx_report.get("returned")
-                            entry["Esync Long"]=rx_report.get("long")
+                            entry["Esync Rho"]=rx_report.get("rho")
+                            entry["Esync SNR (dB)"]=rx_report.get("snr_db")
                             for ch in channels:
                                 entry[f"Channel_{ch}_voltages"]=channels_voltages[ch].tolist()
                                 entry[f"Channel_{ch}_median"]=channel_median[ch]
@@ -755,10 +548,7 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
 def test(tags, exciter_type, exc_power=EXC_POWER, exciter_settings=None):
     global cmd_qs, processes, result_q
     
-    # An unsynced check that the tags answer and that the carrier is
-    # reaching them, so it wants the carrier up and nothing else -- no
-    # blank, which is why this takes the exciter itself and not a
-    # NullExciter, and why it works for an EXCITER that cannot blank at all.
+    # Unsynced: just checks the tags answer and the carrier reaches them.
     exc = exciters.make_exciter(exciter_type, **(exciter_settings or {}))
     if exc is not None:
         exc.set_pwr(exc_power)
@@ -820,62 +610,23 @@ def test(tags, exciter_type, exc_power=EXC_POWER, exciter_settings=None):
 
     exciters.shutdown(exc)
 
-    # Leave the tags with no esync state before the real run stages its own.
-    # This is the last point where every tag is known to be reachable and
-    # idle, and the state being cleared is not this script's -- it is
-    # whatever a previous run left armed or staged when it died. See
-    # _reset_esync(); a "listening":1 in a fresh run's esyncr is the symptom.
+    # Clear whatever a previous, crashed run left armed or staged.
     resetEsyncState(tags)
 
     return {"Test": "done"}
 
 
 def resetEsyncState(tags, timeout=30):
-    """Disarm the detector and clear the staged command on every tag.
-
-    Safe to call on a tag that has neither: `esyncs` and `qc` both answer
-    the same whether or not there was anything to undo.
-
-    Failures are reported and swallowed rather than raised. This is
-    housekeeping before the run proper, and a tag that cannot be reset is
-    about to fail the staging barrier anyway, with a better message than
-    one from here.
-    """
-    global cmd_qs
-
+    """Disarm and clear the staged command on every tag. Failures are only
+    reported: a tag that can't be reset fails the staging barrier anyway."""
     targets = [t for t in tags if t in cmd_qs]
-    if not targets:
-        return
-
     for tag in targets:
         cmd_qs[tag].put("esync_reset")
-
     try:
         got = _gather(result_q, "esync_reset", targets, timeout=timeout)
     except Exception as e:
         print(f"⚠️  could not clear esync state: {e}")
         return
-
     failed = sorted(t for t, ok in got.items() if not ok)
     if failed:
         print(f"⚠️  could not clear esync state on tag(s) {failed}")
-    else:
-        print(f"esync state cleared on {len(targets)} tag(s): "
-              f"not listening, nothing staged")
-
-# if __name__=="__main__":
-#     initialize()
-#     test()
-#     main(1)
-
-
-def netInitialize():
-    try:
-        initialize()
-    except:
-        return {"status": "initializationErrror"}    
-    return {"status": "Initialized"}
-
-def ping():
-    return {"status": "good"}
-

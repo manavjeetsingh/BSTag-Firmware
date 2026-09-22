@@ -33,118 +33,55 @@ class Exciter:
 
 
 class BladeRFExciter:
-    """A bladeRF on ANOTHER machine, over the control link of
-    BladeRFCode/null_sync/bladerf_exciter_server.py.
+    """A bladeRF on ANOTHER machine, via BladeRFCode/ASK_sync/bladerf_exciter_server.py.
 
-    Not the usual way to drive one. A bladeRF in this machine's USB port is
-    driven in process -- exciters.make_bladerf builds a bladerf_cw.CWExciter
-    and calls it directly, with no server to start and no socket. This class
-    is for the split setup: tags here, radio (and flowgraph) over there.
-
-    Same set_freq/set_pwr/blank as CWExciter, so nothing above this cares
-    which of the two it holds; the only difference is that each call costs a
-    round trip and the server has to already be running -- there is nothing
-    here that can bring a transmitter up.
-
-    set_pwr takes the run's EXC_POWER, and for this exciter that number is
-    TX GAIN IN dB, not a level: a bladeRF has no calibrated output to ask
-    for one. It goes to the radio as given. See POWER IS GAIN in
-    bladerf_cw.py.
+    A bladeRF in this machine's USB port is driven in process instead (see
+    data_collection/exciters.py). Same set_freq/set_pwr/sync as
+    bladerf_cw.CWExciter; set_pwr is TX gain in dB, and below 0 mutes.
     """
 
     def __init__(self, host="127.0.0.1", port=BLADERF_PORT,
                  timeout=BLADERF_TIMEOUT):
-        self.host = host
-        self.port = int(port)
-        self.timeout = timeout
-        self.sock = None
-        self._buf = b''
-        self.connect()
-
-    def connect(self):
         try:
-            self.sock = socket.create_connection((self.host, self.port),
-                                                 timeout=self.timeout)
+            self.sock = socket.create_connection((host, int(port)),
+                                                 timeout=timeout)
         except OSError as e:
             raise Exception(
-                f"could not reach the bladeRF exciter server at "
-                f"{self.host}:{self.port} ({e}). This path is only for a "
-                f"bladeRF on another machine, and needs "
-                f"bladerf_exciter_server.py running there. If the bladeRF is "
-                f"in this machine, clear BLADERF_HOST in configurations.json "
-                f"-- the run then drives the radio itself, with no server.")
+                f"could not reach bladerf_exciter_server.py at {host}:{port} "
+                f"({e}). For a bladeRF in this machine, clear BLADERF_HOST.")
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._buf = b''
 
     def _cmd(self, line):
-        """Send one command, return the server's reply, raise on 'err ...'.
-
-        Synchronous by design: every caller here is setting up the carrier
-        the next measurement runs against, so a write that did not land has
-        to be an exception and not a silently wrong run.
-        """
+        """Send one command and return the reply; raise on 'err ...'."""
         if self.sock is None:
             raise Exception("bladeRF exciter link is closed")
         self.sock.sendall((line + "\n").encode("ascii"))
-
         while b"\n" not in self._buf:
             try:
                 chunk = self.sock.recv(4096)
             except socket.timeout:
-                raise Exception(f"bladeRF exciter did not answer {line!r} "
-                                f"within {self.timeout}s")
+                raise Exception(f"bladeRF exciter did not answer {line!r}")
             if not chunk:
                 raise Exception(f"bladeRF exciter closed the link on {line!r}")
             self._buf += chunk
-
         raw, self._buf = self._buf.split(b"\n", 1)
         reply = raw.decode("ascii", "replace").strip()
         if reply.startswith("err"):
             raise Exception(f"bladeRF exciter rejected {line!r}: {reply}")
         return reply
 
-    def ping(self):
-        return self._cmd("ping")
-
-    def status(self):
-        return self._cmd("status")
-
     def set_freq(self, freq):
-        """Tune the EMITTED carrier to `freq` MHz (same units as Exciter)."""
         return self._cmd(f"freq {freq}")
 
     def set_pwr(self, pwr):
-        """Set the TX gain in dB -- not a level, see the class docstring.
-
-        A negative request (the -30 the tooling parks the exciter at between
-        runs) is below any gain the radio has, so the server reads it as off
-        and mutes the carrier in baseband, which is a deeper off than
-        minimum gain.
-        """
         return self._cmd(f"power {pwr}")
 
-    def blank(self, hold_s):
-        """Take the carrier to zero for `hold_s`, then bring it back.
-
-        This is the sync blank the tags time off: they latch the falling
-        edge and dead-reckon from it. Returns (t_drop, t_restore) as host
-        wall clock, which is bookkeeping only -- the real blank starts once
-        the samples already queued in the sink have drained, a few tens of
-        ms after this call, and the tags do not care because they time off
-        the edge rather than off anything the host knows.
-        """
-        t_drop = time.time()
-        self._cmd(f"blank {hold_s*1e3:g}")
-        # The gate's length is exact; this sleep is here so the caller does
-        # not go on to the next round while the carrier is still down.
-        time.sleep(hold_s)
-        return t_drop, time.time()
-
-    def carrier_off(self):
-        return self._cmd("off")
-
-    def carrier_on(self):
-        return self._cmd("on")
+    def sync(self):
+        """Send one ASK sync preamble. Returns (t_start, t_end), host clock."""
+        t_start = time.time()
+        self._cmd("sync")
+        return t_start, time.time()
 
     def close(self):
         if self.sock is None:
@@ -153,10 +90,7 @@ class BladeRFExciter:
             self._cmd("quit")
         except Exception:
             pass
-        try:
-            self.sock.close()
-        except Exception:
-            pass
+        self.sock.close()
         self.sock = None
 
 
@@ -297,8 +231,8 @@ class Tag:
             back once the radio is up.
 
             That also makes this the signal that the window is over -- it
-            returns either because the edge fired or because the firmware
-            hit ESYNC_WIFI_TIMEOUT_MS. Ask qr which it was.
+            returns either because the tag synced and fired or because the
+            firmware hit ESYNC_WIFI_TIMEOUT_MS. Ask qr which it was.
 
             connect_wifi() retries forever, so the deadline lives here.
         """
@@ -336,7 +270,7 @@ class Tag:
             Pulls the reply the firmware buffered while the radio was down.
             Returns the command's own JSON, or {"info":"qr","pending":0} if
             no queued command ran -- which is how a timed-out window (no
-            exciter edge) is told apart from a good one.
+            preamble lock) is told apart from a good one.
 
             `ack` is for staged commands that do NOT answer in JSON: rdb
             replies with the plain line "rdb", so qr hands that line back
@@ -392,9 +326,7 @@ class Tag:
 
     def esync_report(self, timeout=WIFI_TIMEOUT):
         """
-            Serial counterpart to esync_report_wifi(). The detector no longer
-            prints the edge as it happens -- that write sat between the edge
-            and the dispatch -- so this is how the timing is read back.
+            Serial counterpart to esync_report_wifi().
         """
         discard_read = self.ser.readline()
         self.ser.write(bytes("esyncr\r\n", "UTF8"))
@@ -402,18 +334,11 @@ class Tag:
 
     def esync_report_wifi(self, timeout=WIFI_TIMEOUT):
         """
-            The edge that fired the queued command: t_us (the falling edge
-            it timed off), fire_us (when the command actually ran), low_us
-            (the blank as measured), and the min/baseline levels it was
-            judged against.
-
-            The tag commits at the falling edge and fires delay_us later
-            without waiting to see the blank end, so low_us is an
-            after-the-fact check rather than something the tag acted on:
-            it should read back as the exciter's DROP_MS. "returned":0
-            means the carrier had not come back by the time it fired.
-            Useful for checking threshold margin and for comparing low_us
-            across tags.
+            The esyncr line. After a fire: t_us (the preamble lock), fire_us,
+            rho (correlation, 0..1), on_mv/off_mv/swing_mv, resid_mv (noise)
+            and snr_db. With nothing fired: "pending":0 plus peak_rho, the
+            best correlation seen -- near 0.8 means heard but too noisy,
+            near 0 means never heard.
         """
         discard_read = self._wifi_readline()
         self._wifi_write(bytes("esyncr\r\n", "UTF8"))
@@ -467,11 +392,11 @@ class Tag:
 
     def stop_esync(self):
         """
-            Disarms the edge detector (`esyncs`).
+            Disarms the preamble detector (`esyncs`).
 
             The counterpart to listen_esync(). Needed because arming is
             sticky in a way that outlives the host: a run killed between
-            `esync` and the edge leaves the tag listening, and the firmware
+            `esync` and the sync leaves the tag listening, and the firmware
             only resumes its radio after ESYNC_WIFI_TIMEOUT_MS -- it does
             not stop listening. The next run then finds a tag already
             armed, reporting "listening":1 from somebody else's window.
@@ -492,7 +417,7 @@ class Tag:
 
     def clear_queued_command(self):
         """
-            Drops whatever command is staged to fire on the next edge
+            Drops whatever command is staged to fire on the next sync
             (`qc`).
 
             Note this is the staged COMMAND, not the reply it leaves
@@ -555,7 +480,7 @@ class Tag:
 
     def queue_capture(self):
         """
-            Stages a buffered capture (rdb) to start on the next esync edge.
+            Stages a buffered capture (rdb) to start on the next esync.
 
             Unlike queue_adc_read(), the trace does NOT come back through
             qr: rdb's own reply is just an ack, and the samples stay in the
@@ -578,13 +503,13 @@ class Tag:
 
     def read_queued(self, timeout=None):
         """
-            Blocks until the queued command fires on the next esync edge and
+            Blocks until the queued command fires on the next esync and
             returns its reply, parsed as JSON. Works for any command whose
             reply is a JSON blob (adc, adcraw, rds, mpp, mac, net); commands
             that answer in plain text (ch_) will time out here.
 
             Defaults to self.resetTime rather than the few seconds the other
-            calls use, since the wait is for the exciter edge, not the tag.
+            calls use, since the wait is for the exciter's preamble.
         """
         if timeout is None:
             timeout = self.resetTime
@@ -595,7 +520,7 @@ class Tag:
         """
             WiFi counterpart to read_queued(). Also defaults to
             self.resetTime instead of WIFI_TIMEOUT: what is being waited on
-            is the exciter edge, which the link speed has no bearing on.
+            is the exciter's preamble, which the link speed has no bearing on.
         """
         if timeout is None:
             timeout = self.resetTime

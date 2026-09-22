@@ -169,6 +169,11 @@ def main():
     # and which half of the Tag API the workers drive.
     connection = configurations.get("CONNECTION", mtt.WIRED).lower()
     print(f"Connection: {connection}")
+    if connection == mtt.WIRELESS and exciter_type != "bladerf":
+        raise Exception(
+            f"a wireless run is synced by the bladeRF's ASK preamble, but "
+            f"EXCITER is {exciter_type!r}. Set EXCITER to \"bladerf\" (and "
+            f"EXC_POWER to a gain, ~60), or CONNECTION to \"wired\".")
 
     tag_endpoint_mapping, tag_mac_mapping, mac_tag_mapping=detect_tags(connection)
     mtt.initialize(tag_endpoint_mapping, transport=connection)
@@ -200,10 +205,6 @@ def main():
         exc_power=configurations["EXC_POWER"],
         tag_mac_mapping=tag_mac_mapping,
         transport=connection,
-        # Wireless only: how long the exciter holds its null. Ignored by a
-        # wired run, which does not sync off a blank at all.
-        esync_null_hold_s=configurations.get("ESYNC_NULL_HOLD_S",
-                                             mtt.esync_mpp.NULL_HOLD_S),
         exciter_settings=exciter_settings)
 
 

@@ -1,131 +1,122 @@
 #include "esync.h"
 
+#include <math.h>
+
 #include "commands.h"
 #include "config.h"
 #include "hardware.h"
 
+static const int8_t CODE[] = ESYNC_CODE;
+
+#define CHIPS      ((int32_t)(sizeof(CODE) / sizeof(CODE[0])))
+#define CHIP_BINS  ((int32_t)(ESYNC_CHIP_US / ESYNC_BIN_US))  /* bins per chip */
+#define NBIN       (CHIPS * CHIP_BINS)                         /* bins per preamble */
+#define RING       (NBIN + 1)                                  /* prefix sums: one extra */
+#define BIN_SHIFT  4                                           /* bins kept as raw << 4 */
+
+static_assert(ESYNC_CHIP_US % ESYNC_BIN_US == 0,
+              "ESYNC_BIN_US must divide ESYNC_CHIP_US");
+static_assert(ESYNC_FIRE_DELAY_US > ESYNC_CONFIRM_US + ESYNC_BIN_US,
+              "the fire must land after the peak is confirmed");
+
+struct EsyncLock {
+    uint32_t t_us;       /* end of the preamble, from the correlation peak */
+    float    rho;        /* correlation at the peak, 0..1 */
+    float    on_mv;      /* mean level over the ON chips */
+    float    off_mv;     /* mean level over the OFF chips */
+    float    resid_mv;   /* per-bin RMS the code does not explain: noise */
+};
+
 static bool     listen_for_esync = false;
 
-/* Moving window of raw ADC codes, oldest sample at esync_head. */
-static uint16_t esync_buf[ESYNC_BUF_LEN];
-static uint32_t esync_head = 0;      /* next write position */
-static uint32_t esync_count = 0;     /* valid samples, saturates at the len */
-static uint32_t esync_sum = 0;       /* running sum, seeds the baseline */
-static uint32_t esync_sample_us = 0; /* micros() of the newest sample */
+/* Newest sample, timestamped at the read so the gap between reading and
+ * looking at it never lands in the timing. */
+static uint16_t sample_raw = 0;
+static uint32_t sample_us = 0;
+static bool     sample_new = false;
 
-/* Detector state. */
-static uint16_t esync_drop_thr = 0;     /* fixed floor, in raw codes */
-static bool     esync_primed = false;   /* baseline seeded, level state known */
-static bool     esync_high = true;      /* false while the signal is dropped */
-static int32_t  esync_base_acc = 0;     /* baseline << ESYNC_BASELINE_SHIFT */
+/* Code constants, filled in by esyncReset(). */
+static int32_t  code_sum = 0;     /* ON chips minus OFF chips */
+static int32_t  code_on = 0;      /* number of ON chips */
+static float    tmpl_energy = 0;  /* sum over bins of (code - mean)^2 */
+static float    min_swing = 0;    /* ESYNC_MIN_SWING_MV in bin units */
 
-/* The pending fire. Latched at the falling edge and committed to from
- * that moment: once armed, the only thing that can call it off is the
- * carrier coming back early. */
-static bool     esync_fire_armed = false;
-static uint32_t esync_fire_at_us = 0;
+/* Running prefix sums of the bin values and their squares. A window sum is
+ * the difference of two entries; unsigned wraparound keeps the difference
+ * right no matter how long the listener runs. */
+static uint64_t p_x[RING];
+static uint64_t p_xx[RING];
+static uint32_t ring_head = 0;
+static uint32_t bins_filled = 0;
 
-/* Stats for the blank currently in progress. */
-static uint32_t esync_low_enter_us = 0;
-static uint16_t esync_low_min = 0;
-/* The blank's measured length, filled in if the carrier returns before
- * the fire deadline. Zero at fire time means it had not come back yet. */
-static uint32_t esync_low_us = 0;
+/* The bin being accumulated. */
+static bool     started = false;
+static uint32_t bin_start_us = 0;
+static uint32_t bin_acc = 0;
+static uint32_t bin_cnt = 0;
+static uint32_t last_val = 0;     /* an empty bin repeats the one before */
 
-/* Lowest sample since arming. A run where nothing fires and this never
- * drops near the floor means the blank is not reaching ESYNC_MIN_BASELINE_MV
- * at all, which no amount of widening the length window will fix. */
-static uint16_t esync_seen_min = 0xFFFF;
+static uint32_t samples = 0;
+static uint16_t stalls = 0;       /* gaps longer than a preamble: window restarted */
 
-/* Rejection tally, so a run that never fires says why without a scope:
- * the floor was reached but the carrier came back before
- * ESYNC_BLANK_MIN_US -- a fade rather than a blank. It is decided inside
- * the delay window, while calling the fire off is still possible.
- *
- * A blank too SHALLOW to be real needs no tally: the falling edge is the
- * floor test, so a sag that never reaches ESYNC_MIN_BASELINE_MV never
- * latches an edge in the first place. min_mv against base_mv is what says
- * so, exactly as it did before anything fired.
- *
- * There is deliberately no rej_long counterpart either. A blank that
- * overruns is only knowable after the tag has already fired against it,
- * so it cannot be a rejection -- it comes back as the "long" flag on the
- * fired report. */
-static uint16_t esync_rej_short = 0;
+/* Peak tracking. Correlations are kept squared: the ordering is the same
+ * for positive scores, and the square roots are only needed at the lock. */
+static float    prev_r2 = 0;
+static bool     have_best = false;
+static float    best_r2 = 0;
+static float    best_prev_r2 = 0;
+static float    best_next_r2 = 0;
+static uint32_t best_end_us = 0;
+static uint32_t bins_since_best = 0;
+static EsyncLock best;
 
-/* Last edge, latched for esyncReport(). Printing from the detector would
- * put a blocking USB/UART write between the edge and runQueuedCommand(),
- * which is exactly the latency this whole path exists to avoid. */
-static bool     esync_rep_valid = false;
-static uint32_t esync_rep_t_us = 0;
-static uint32_t esync_rep_fire_us = 0;
-static uint32_t esync_rep_low_us = 0;
-static uint16_t esync_rep_min = 0;
-static uint16_t esync_rep_base = 0;
+/* Best score seen since arming, lockable or not: the "how close" number. */
+static float    seen_r2 = 0;
+static float    seen_swing_mv = 0;
+static float    level_mv = 0;
+
+/* The pending fire. Committed to from the lock. */
+static bool     locked = false;
+static uint32_t fire_at_us = 0;
+static EsyncLock lock;
+
+/* Last fire, latched for esyncReport(). */
+static bool     rep_valid = false;
+static uint32_t rep_fire_us = 0;
+static EsyncLock rep;
+
+static float binToMv(float v)
+{
+    return v * (ADC_REF_MV / 65535.0f / (float)(1 << BIN_SHIFT));
+}
+
+static uint32_t back(uint32_t n)
+{
+    return (ring_head + RING - n) % RING;
+}
+
+static void restartWindow(uint32_t t_us)
+{
+    ring_head = 0;
+    p_x[0] = 0;
+    p_xx[0] = 0;
+    bins_filled = 0;
+    bin_start_us = t_us;
+    bin_acc = 0;
+    bin_cnt = 0;
+    prev_r2 = 0;
+    have_best = false;
+}
 
 void esyncListen(void)
 {
     switchChannel(ESYNC_CHANNEL);
     esyncReset();
     /* A new run invalidates the last one: better to report nothing than
-     * to hand back a stale edge or a stale reply. */
+     * to hand back a stale lock or a stale reply. */
     esyncClearReport();
     clearQueuedReply();
-    esync_rej_short = 0;
     listen_for_esync = true;
-}
-
-void esyncClearReport(void)
-{
-    esync_rep_valid = false;
-}
-
-void esyncReport(Print &out)
-{
-    if (!esync_rep_valid) {
-        /* Nothing has fired. Report what the detector is actually doing so
-         * a silent run can be told apart from a stuck one: not primed means
-         * the warmup window has not filled, in_blank means it is inside a
-         * blank, armed means a falling edge is latched and the fire is
-         * already committed, and min_mv against base_mv says whether the
-         * signal is reaching the floor at all. */
-        int32_t base = esync_base_acc >> ESYNC_BASELINE_SHIFT;
-        out.printf("{\"info\":\"esync\",\"pending\":0,\"listening\":%d,"
-                   "\"primed\":%d,\"in_blank\":%d,\"armed\":%d,\"samples\":%lu,"
-                   "\"base_mv\":%.3f,\"min_mv\":%.3f,"
-                   "\"rej_short\":%u}\n",
-                   listen_for_esync ? 1 : 0,
-                   esync_primed ? 1 : 0,
-                   esync_high ? 0 : 1,
-                   esync_fire_armed ? 1 : 0,
-                   (unsigned long)esync_count,
-                   rawToMilliVolts((uint16_t)base),
-                   rawToMilliVolts(esync_seen_min == 0xFFFF ? 0 : esync_seen_min),
-                   esync_rej_short);
-        return;
-    }
-    /* t_us is the falling edge the timing came off; fire_us is when the
-     * queued command actually ran, and should sit ESYNC_FIRE_DELAY_US past
-     * it. low_us is the blank as measured -- the after-the-fact check on
-     * everything the fall-triggered detector could not check in advance.
-     * It reads 0 when the carrier had not returned by the time we fired,
-     * which is the loud case: the blank was longer than the tag assumed.
-     * "long" folds both overruns into one flag for a host that just wants
-     * to know whether to trust the shot. */
-    bool never_returned = (esync_rep_low_us == 0);
-    bool ran_long = never_returned || (esync_rep_low_us > ESYNC_BLANK_MAX_US);
-    out.printf("{\"info\":\"esync\",\"edge\":\"fall\",\"t_us\":%lu,"
-               "\"fire_us\":%lu,\"delay_us\":%lu,\"low_us\":%lu,"
-               "\"returned\":%d,\"long\":%d,"
-               "\"min_mv\":%.3f,\"base_mv\":%.3f}\n",
-               (unsigned long)esync_rep_t_us,
-               (unsigned long)esync_rep_fire_us,
-               (unsigned long)ESYNC_FIRE_DELAY_US,
-               (unsigned long)esync_rep_low_us,
-               never_returned ? 0 : 1,
-               ran_long ? 1 : 0,
-               rawToMilliVolts(esync_rep_min),
-               rawToMilliVolts(esync_rep_base));
 }
 
 void esyncStop(void)
@@ -139,190 +130,248 @@ bool esyncActive(void)
     return listen_for_esync;
 }
 
+void esyncClearReport(void)
+{
+    rep_valid = false;
+}
+
 void esyncReset(void)
 {
-    esync_head = 0;
-    esync_count = 0;
-    esync_sum = 0;
-    esync_drop_thr = milliVoltsToRaw(ESYNC_MIN_BASELINE_MV);
-    esync_primed = false;
-    esync_high = true;
-    esync_base_acc = 0;
-    esync_fire_armed = false;
-    esync_fire_at_us = 0;
-    esync_low_enter_us = 0;
-    esync_low_min = 0;
-    esync_low_us = 0;
-    esync_seen_min = 0xFFFF;
+    code_sum = 0;
+    code_on = 0;
+    for (int32_t k = 0; k < CHIPS; k++) {
+        code_sum += CODE[k];
+        code_on += (CODE[k] > 0);
+    }
+    tmpl_energy = (float)CHIP_BINS *
+                  (float)(CHIPS * CHIPS - code_sum * code_sum) / (float)CHIPS;
+    min_swing = ESYNC_MIN_SWING_MV * 65535.0f * (float)(1 << BIN_SHIFT) /
+                ADC_REF_MV;
+
+    sample_new = false;
+    started = false;
+    restartWindow(0);
+    last_val = 0;
+    samples = 0;
+    stalls = 0;
+    seen_r2 = 0;
+    seen_swing_mv = 0;
+    level_mv = 0;
+    locked = false;
+    fire_at_us = 0;
+}
+
+void esyncReport(Print &out)
+{
+    if (!rep_valid) {
+        /* Nothing has fired. primed means a full preamble's worth of bins
+         * is in, armed means a peak is locked and the fire is committed,
+         * and peak_rho is the best score seen: near ESYNC_MIN_RHO means the
+         * preamble was heard but too noisy, near zero means it never was. */
+        out.printf("{\"info\":\"esync\",\"pending\":0,\"listening\":%d,"
+                   "\"primed\":%d,\"armed\":%d,\"samples\":%lu,\"stalls\":%u,"
+                   "\"peak_rho\":%.3f,\"peak_swing_mv\":%.3f,\"level_mv\":%.3f}\n",
+                   listen_for_esync ? 1 : 0,
+                   bins_filled >= (uint32_t)NBIN ? 1 : 0,
+                   locked ? 1 : 0,
+                   (unsigned long)samples,
+                   stalls,
+                   sqrtf(seen_r2), seen_swing_mv, level_mv);
+        return;
+    }
+    /* t_us is the end of the preamble as the correlation peak put it;
+     * fire_us should sit ESYNC_FIRE_DELAY_US past it. swing_mv against
+     * resid_mv is the margin: how far the pattern stood above what it
+     * could not explain. */
+    float swing = rep.on_mv - rep.off_mv;
+    float snr_db = (rep.resid_mv > 0.0f && swing > 0.0f)
+                   ? 20.0f * log10f(swing / rep.resid_mv) : 0.0f;
+    out.printf("{\"info\":\"esync\",\"t_us\":%lu,\"fire_us\":%lu,"
+               "\"delay_us\":%lu,\"rho\":%.3f,\"on_mv\":%.3f,\"off_mv\":%.3f,"
+               "\"swing_mv\":%.3f,\"resid_mv\":%.3f,\"snr_db\":%.1f}\n",
+               (unsigned long)rep.t_us,
+               (unsigned long)rep_fire_us,
+               (unsigned long)ESYNC_FIRE_DELAY_US,
+               rep.rho, rep.on_mv, rep.off_mv, swing, rep.resid_mv, snr_db);
 }
 
 void esyncSample(void)
 {
-    uint16_t s = readAdcRaw();
-    /* Timestamped at the read, not where it is looked at, so the gap
-     * between the two never lands in the measured blank length. */
-    esync_sample_us = micros();
+    sample_raw = readAdcRaw();
+    sample_us = micros();
+    sample_new = true;
+}
 
-    if (esync_count == ESYNC_BUF_LEN) {
-        esync_sum -= esync_buf[esync_head];   /* evict the oldest */
-    } else {
-        esync_count++;
+/* Parabola through the peak and its neighbours, in bins, within +-0.5. */
+static float peakOffset(float ym, float y0, float yp)
+{
+    float den = ym - 2.0f * y0 + yp;
+    if (den >= 0.0f) {
+        return 0.0f;
+    }
+    float d = 0.5f * (ym - yp) / den;
+    return d > 0.5f ? 0.5f : (d < -0.5f ? -0.5f : d);
+}
+
+static void commitLock(void)
+{
+    float d = peakOffset(sqrtf(best_prev_r2), sqrtf(best_r2),
+                         sqrtf(best_next_r2));
+    lock = best;
+    lock.t_us = best_end_us + (int32_t)lroundf(d * ESYNC_BIN_US);
+    fire_at_us = lock.t_us + ESYNC_FIRE_DELAY_US;
+    locked = true;
+}
+
+/* Score the window that ends at end_us: the last NBIN bins, oldest chip
+ * first, against the code. */
+static void evaluate(uint32_t end_us)
+{
+    const int64_t n = NBIN;
+    int64_t x  = (int64_t)(p_x[ring_head] - p_x[back(NBIN)]);
+    int64_t xx = (int64_t)(p_xx[ring_head] - p_xx[back(NBIN)]);
+
+    int64_t on = 0, off = 0;
+    for (int32_t k = 0; k < CHIPS; k++) {
+        uint32_t from = NBIN - k * CHIP_BINS;
+        int64_t s = (int64_t)(p_x[back(from - CHIP_BINS)] - p_x[back(from)]);
+        if (CODE[k] > 0) {
+            on += s;
+        } else {
+            off += s;
+        }
     }
 
-    esync_buf[esync_head] = s;
-    esync_sum += s;
-    esync_head = (esync_head + 1) % ESYNC_BUF_LEN;
+    /* Both scaled up to stay exact in integers: num is CHIPS times the
+     * covariance sum, var_n is n times the variance sum. */
+    int64_t num   = (int64_t)CHIPS * (on - off) - (int64_t)code_sum * x;
+    int64_t var_n = n * xx - x * x;
+
+    float r2 = 0.0f;
+    float var = 0.0f;
+    if (num > 0 && var_n > 0) {
+        float cov = (float)num / (float)CHIPS;
+        var = (float)var_n / (float)n;
+        r2 = cov * cov / (tmpl_energy * var);
+    }
+
+    float on_mean  = (float)on  / (float)(code_on * CHIP_BINS);
+    float off_mean = (float)off / (float)((CHIPS - code_on) * CHIP_BINS);
+    float swing = on_mean - off_mean;
+
+    level_mv = binToMv((float)x / (float)n);
+    if (r2 > seen_r2) {
+        seen_r2 = r2;
+        seen_swing_mv = binToMv(swing);
+    }
+
+    bool passes = r2 >= ESYNC_MIN_RHO * ESYNC_MIN_RHO && swing >= min_swing;
+
+    if (passes && (!have_best || r2 > best_r2)) {
+        have_best = true;
+        best_r2 = r2;
+        best_prev_r2 = prev_r2;
+        best_next_r2 = 0.0f;
+        best_end_us = end_us;
+        bins_since_best = 0;
+        best.rho = sqrtf(r2);
+        best.on_mv = binToMv(on_mean);
+        best.off_mv = binToMv(off_mean);
+        float resid = var / (float)n * (1.0f - r2);
+        best.resid_mv = binToMv(sqrtf(resid > 0.0f ? resid : 0.0f));
+    } else if (have_best) {
+        if (bins_since_best == 0) {
+            best_next_r2 = r2;
+        }
+        bins_since_best++;
+        if (bins_since_best * ESYNC_BIN_US >= ESYNC_CONFIRM_US) {
+            commitLock();
+        }
+    }
+    prev_r2 = r2;
+}
+
+static void closeBin(uint32_t end_us)
+{
+    uint32_t val = bin_cnt ? (bin_acc << BIN_SHIFT) / bin_cnt : last_val;
+    last_val = val;
+    bin_acc = 0;
+    bin_cnt = 0;
+
+    uint32_t nh = (ring_head + 1) % RING;
+    p_x[nh]  = p_x[ring_head]  + val;
+    p_xx[nh] = p_xx[ring_head] + (uint64_t)val * val;
+    ring_head = nh;
+
+    if (bins_filled < (uint32_t)NBIN) {
+        bins_filled++;
+    }
+    if (bins_filled >= (uint32_t)NBIN) {
+        evaluate(end_us);
+    }
+}
+
+static void feed(uint16_t raw, uint32_t t_us)
+{
+    samples++;
+
+    if (!started) {
+        started = true;
+        restartWindow(t_us);
+        last_val = (uint32_t)raw << BIN_SHIFT;
+    }
+
+    uint32_t nclose = (t_us - bin_start_us) / ESYNC_BIN_US;
+    if (nclose > (uint32_t)NBIN) {
+        /* The loop stalled for longer than a whole preamble. Filling that
+         * many bins with a held value would only feed the correlator a flat
+         * line with a step at each end, so start the window over. */
+        stalls++;
+        restartWindow(t_us);
+        last_val = (uint32_t)raw << BIN_SHIFT;
+        nclose = 0;
+    }
+    for (uint32_t i = 0; i < nclose; i++) {
+        bin_start_us += ESYNC_BIN_US;
+        closeBin(bin_start_us);
+        if (locked) {
+            return;
+        }
+    }
+
+    bin_acc += raw;
+    bin_cnt++;
 }
 
 /*
- * Blank detector, driven one sample per loop() pass.
+ * Preamble detector, driven one sample per loop() pass.
  *
- * The idle level is tracked with a leaky integrator that is frozen while
- * the signal is down, so it settles on the baseline no matter how often
- * the blanks come or how long they last.
- *
- * Timing comes off the FALLING edge, taken as the first sample at or
- * under ESYNC_MIN_BASELINE_MV. That one absolute test is both the timing
- * reference and the proof the blank is real: the exciter drives the
- * carrier to the floor, so a sag that never gets there never latches an
- * edge, and no separate depth check is needed.
- *
- * An absolute floor rather than a fraction of baseline costs almost
- * nothing here. Tags receiving different amplitudes cross a fixed low
- * threshold at slightly different points down the fall, but with the
- * threshold this close to zero the spread is a fraction of a percent of
- * the fall time -- well under a microsecond, against a sample period of
- * tens. A proportional threshold would zero that term and buy nothing
- * measurable, while making the reference depend on the tracked baseline
- * being right.
- *
- * The queued command then runs ESYNC_FIRE_DELAY_US after that edge, by
- * dead reckoning, which lands where the carrier is due back.
- *
- * The order of business inside a blank is what makes this safe. The fire
- * deadline is checked before anything else, so nothing -- not a
- * threshold recomputation, not a baseline collapse -- can sit between the
- * deadline and the dispatch. The one thing that can still call the fire
- * off is decided strictly earlier than that deadline: the early-return
- * test at ESYNC_BLANK_MIN_US, where a blank that is already over was a
- * fade, and the carrier coming back is proof of it while there is still
- * time to act on the proof.
- *
- * What cannot be checked is the other end. The tag is committed from the
- * falling edge, so a blank that overruns -- an outage, a scale mismatch
- * -- is fired against regardless and only shows up afterwards, in the
- * measured low_us that esyncReport() hands back. That is the price of
- * timing off the fall, and it is why low_us is worth reading on any run
- * whose results look off.
+ * The committed fire is checked ahead of everything else, and once locked
+ * the correlator takes no more samples: nothing can sit between the
+ * deadline and the dispatch, and nothing seen after the lock can move it.
  */
 void esyncListening(void)
 {
-    if (esync_count == 0) {
+    if (!sample_new) {
         return;
     }
+    sample_new = false;
 
-    uint16_t newest = esync_buf[(esync_head + ESYNC_BUF_LEN - 1) % ESYNC_BUF_LEN];
-    uint32_t now_us = esync_sample_us;
-
-    /* Seed the baseline from the warmup window, then adopt the current
-     * level without calling it an edge. Priming never arms a fire: the
-     * transition into a known state is not a falling edge. */
-    if (!esync_primed) {
-        if (esync_count < ESYNC_WARMUP_SAMPLES) {
-            return;
-        }
-        int32_t seed = (int32_t)(esync_sum / esync_count);
-        esync_base_acc = seed << ESYNC_BASELINE_SHIFT;
-        esync_primed = true;
-        esync_high = (newest > esync_drop_thr);
-        esync_fire_armed = false;
-        return;
-    }
-
-    /* The committed fire, ahead of every other consideration. Signed
-     * difference so a micros() wrap inside the delay window still
+    /* Signed difference so a micros() wrap inside the delay still
      * compares correctly. */
-    if (esync_fire_armed && (int32_t)(now_us - esync_fire_at_us) >= 0) {
-        esync_rep_t_us    = esync_low_enter_us;
-        esync_rep_fire_us = now_us;
-        esync_rep_low_us  = esync_low_us;
-        esync_rep_min     = esync_low_min;
-        esync_rep_base    = (uint16_t)(esync_base_acc >> ESYNC_BASELINE_SHIFT);
-        esync_rep_valid   = true;
+    if (locked) {
+        if ((int32_t)(sample_us - fire_at_us) >= 0) {
+            rep = lock;
+            rep_fire_us = sample_us;
+            rep_valid = true;
 
-        /* One shot: disarm before dispatching, so a queued esync can re-arm
-         * us cleanly instead of being undone by the stop. */
-        esyncStop();
-        runQueuedCommand();
-        return;
-    }
-
-    if (newest < esync_seen_min) {
-        esync_seen_min = newest;
-    }
-
-    int32_t  baseline = esync_base_acc >> ESYNC_BASELINE_SHIFT;
-    uint32_t drop_thr = esync_drop_thr;
-    /* Only the RETURN is judged against the baseline. It is not a timing
-     * reference -- it just has to mean "clearly back up", far enough above
-     * the floor to be hysteresis rather than chatter. */
-    uint32_t rearm_thr = (uint32_t)baseline * (100 - ESYNC_REARM_PCT) / 100;
-
-    if (rearm_thr <= drop_thr) {
-        /* No carrier, or one so weak that the two thresholds cross over
-         * and the state machine would rattle between them. Keep letting
-         * the baseline climb so we recover if the signal comes back. */
-        esync_base_acc += (int32_t)newest - baseline;
-        return;
-    }
-
-    if (esync_high) {
-        if (newest <= drop_thr) {
-            /* Falling edge: at the floor, so this is a blank and not a
-             * sag. This instant is the whole timing reference, so the
-             * deadline is set from it here and never revised. */
-            esync_high = false;
-            esync_low_enter_us = now_us;
-            esync_low_min = newest;
-            esync_low_us = 0;
-            esync_fire_at_us = now_us + ESYNC_FIRE_DELAY_US;
-            esync_fire_armed = true;
-        } else if (newest >= rearm_thr) {
-            /* Clearly at rest: the only place the baseline moves. Samples
-             * mid-transition are skipped so an edge cannot pull it down. */
-            esync_base_acc += (int32_t)newest - baseline;
+            /* One shot: disarm before dispatching, so a queued esync can
+             * re-arm us cleanly instead of being undone by the stop. */
+            esyncStop();
+            runQueuedCommand();
         }
         return;
     }
 
-    if (newest < esync_low_min) {
-        esync_low_min = newest;
-    }
-
-    if (!esync_fire_armed) {
-        /* Down, but with no fire pending: primed into a dark band, or a
-         * blank already thrown out. Wait for a settled return before
-         * calling the signal high again -- going high while still under
-         * the threshold would re-trigger on the tail of the same blank. */
-        if (newest >= rearm_thr) {
-            esync_high = true;
-        }
-        return;
-    }
-
-    if (esync_low_us == 0 && newest >= rearm_thr) {
-        /* The carrier is back, and early enough that we still have the
-         * choice. Under ESYNC_BLANK_MIN_US this was a fade: throw the fire
-         * away. Otherwise record the length and let the deadline stand --
-         * a blank that ends slightly early still fires where the exciter
-         * meant it to. */
-        uint32_t low_us = now_us - esync_low_enter_us;
-        if (low_us < ESYNC_BLANK_MIN_US) {
-            esync_rej_short++;
-            esync_fire_armed = false;
-            esync_high = true;
-            return;
-        }
-        esync_low_us = low_us;
-    }
+    feed(sample_raw, sample_us);
 }
