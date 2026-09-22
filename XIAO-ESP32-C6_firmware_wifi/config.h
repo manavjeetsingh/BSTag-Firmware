@@ -149,6 +149,67 @@
 #define MPP_DWELL_QUEUED_US    3000   /* mpp fired by the esync detector */
 #define MPP_MAX_PASSES         1000
 
+/* Slotted schedule (the sq commands, sgo, sqr): the "multiple" collection mode.
+ *
+ * Instead of one transmitter per round, every tag is loaded with an ordered
+ * program of equal-length slots and they all start it on the same trigger --
+ * the exciter's ASK preamble over the air, or sgo over Serial. With three
+ * tags the programs are
+ *
+ *      tag1: [ mpp    , listen , listen ]
+ *      tag2: [ listen , mpp    , listen ]
+ *      tag3: [ listen , listen , mpp    ]
+ *
+ * so one round measures every direction at once. A slot that finishes early
+ * is padded to SCHED_SLOT_US, which is what keeps the tags in step: the
+ * boundaries are absolute offsets from the trigger, not a running total of
+ * however long each command happened to take. */
+#define SCHED_MAX_SLOTS        25     /* one per tag; ~16 B of metadata each */
+#define SCHED_SLOT_US          50000  /* per slot; must exceed the MPP sweep */
+#define SCHED_LISTEN_SAMPLES   2400   /* per listen slot, unless sqn_<n> lowers it */
+
+/* Raw codes for every listen slot of a round, 2 B each. This is the one big
+ * allocation in the firmware, so it is a budget rather than
+ * SCHED_MAX_SLOTS * SCHED_LISTEN_SAMPLES: 25 tags at full length would be
+ * 115 KB, and the free DRAM after globals is the FreeRTOS heap that WiFi and
+ * lwIP allocate from (~90-110 KB of it in use once associated). 96 KB here
+ * leaves ~65 KB spare. The host divides it with sqn_<n>, so small runs get
+ * long traces and only a 25-tag run is squeezed; schedReport() prints the
+ * free heap so the margin is visible rather than a crash. */
+#define SCHED_POOL_SAMPLES     48000
+
+/* Channel order for the scheduled sweep. Shorter than runMppSweep()'s table:
+ * the leading ch1 dwells there exist to let the rectifier settle after the
+ * ch2->ch1 switch, and in a slotted round that settling happens for free in
+ * the previous slot's padding (see schedRun()). One ch1 pad dwell is kept
+ * because mpp_segment.fit_sweep_grid() pins the grid phase on a flat
+ * same-channel boundary immediately before the measured window.
+ *
+ * 8 dwells * MPP_DWELL_QUEUED_US = 24 ms, against 27 ms for the interactive
+ * table. Two things set that length, and both were measured rather than
+ * guessed:
+ *
+ *   - Without the pre-switch, cutting to one leading ch1 puts ch1 out by a
+ *     median 1.8 mV and up to 24 mV, against a 2.5 mV median gap between
+ *     adjacent channels (196 traces). The pre-switch removes that, so the
+ *     leading dwells are no longer paying for settling.
+ *   - What they still pay for is fit_sweep_grid's margin. It needs a whole
+ *     same-channel dwell before the measured window, so the pad has to
+ *     survive the skew between the tags' triggers. With ONE pad dwell and
+ *     the transmitter firing 300 us early, segmentation broke on 75% of
+ *     traces with errors up to 80 mV; with TWO, every trace segmented
+ *     exactly across -600..+600 us of skew.
+ *
+ * So two leading ch1 dwells, not one. Shortening this further needs the
+ * transmitter to delay its sweep inside the slot, to make the skew
+ * one-sided -- which is a timing dependency this does not need. */
+#define MPP_CHANNELS_SCHED     { 1, 1, 1, 3, 4, 6, 7, 8 }
+
+/* Time on ch1 before slot 0's sweep, for the one tag that transmits first
+ * and so has no previous slot to settle in. ~3 tau of the rectifier. Paid
+ * once per round, by every tag, so the slot grid stays common. */
+#define SCHED_PREROLL_US       9000
+
 #if NET_ENABLED
 #define SESSION_COUNT          (1 + MAX_TCP_CLIENTS)   /* slot 0 is Serial */
 #else

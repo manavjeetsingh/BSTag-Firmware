@@ -5,6 +5,7 @@
 #include "commands.h"
 #include "config.h"
 #include "hardware.h"
+#include "schedule.h"
 
 static const int8_t CODE[] = ESYNC_CODE;
 
@@ -368,7 +369,15 @@ void esyncListening(void)
             /* One shot: disarm before dispatching, so a queued esync can
              * re-arm us cleanly instead of being undone by the stop. */
             esyncStop();
-            runQueuedCommand();
+            /* A loaded schedule takes the fire instead of the single
+             * queued command -- that is the whole difference between the
+             * "multiple" and "individual" collection modes at this end.
+             * sqc puts it back. */
+            if (schedLoaded()) {
+                schedRun();
+            } else {
+                runQueuedCommand();
+            }
         }
         return;
     }

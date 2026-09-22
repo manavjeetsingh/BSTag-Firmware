@@ -10,6 +10,7 @@
 #include "esync.h"
 #include "hardware.h"
 #include "net.h"
+#include "schedule.h"
 #include "session.h"
 
 #if NET_ENABLED
@@ -98,6 +99,15 @@ void printHelp(Print &out)
     out.println("  q_<cmd>      queue <cmd>, run it on the next esync lock");
     out.println("  q            show the queued command");
     out.println("  qc           clear the queued command");
+    out.println("  sq_mpp       append a transmit slot to the schedule");
+    out.println("  sq_lis       append a listen slot to the schedule");
+    out.println("  sqd_<us>     slot length (default 50000)");
+    out.println("  sqn_<n>      samples per listen slot");
+    out.println("  squ_raw|mv   trace unit in sqr (default mV)");
+    out.println("  sq           show the loaded schedule");
+    out.println("  sqc          clear the schedule");
+    out.println("  sgo          run the schedule now (wired trigger)");
+    out.println("  sqr          dump every slot's result");
     out.println("  mpp          one MPP channel sweep");
     out.println("  mpp_<n>      n MPP sweeps, max 1000");
     out.println("  net          show wifi status");
@@ -295,6 +305,86 @@ void handleCommand(char *command, Print &out, int session_idx, bool from_queue)
 
     if (strcmp(command, "esyncr") == 0) {
         esyncReport(out);
+        return;
+    }
+
+    /* --- slotted schedule ("multiple" collection mode) --- */
+
+    /* Ordered before the bare "sq" so the prefix forms win: strcmp would
+     * not confuse them, but keeping the longer matches first is the same
+     * shape as adcraw_ before adc_ below. */
+    if (strncmp(command, "sq_", 3) == 0) {
+        const char *kind = command + 3;
+        uint8_t k = 0;
+        if (strcmp(kind, "mpp") == 0) {
+            k = SCHED_KIND_MPP;
+        } else if (strcmp(kind, "lis") == 0) {
+            k = SCHED_KIND_LISTEN;
+        } else {
+            out.println("sq:bad, use sq_mpp or sq_lis");
+            return;
+        }
+        if (!schedAddSlot(k)) {
+            out.printf("sq:full, max %u slots\n", (unsigned)SCHED_MAX_SLOTS);
+            return;
+        }
+        out.printf("sq:added, %s, %u\n", kind, (unsigned)schedSlotCount());
+        return;
+    }
+
+    if (strncmp(command, "sqd_", 4) == 0) {
+        out.printf("sq:slot_us, %lu\n",
+                   (unsigned long)schedSetSlotUs((uint32_t)atol(command + 4)));
+        return;
+    }
+
+    if (strncmp(command, "sqn_", 4) == 0) {
+        out.printf("sq:listen_samples, %lu\n",
+                   (unsigned long)schedSetListenSamples((uint32_t)atol(command + 4)));
+        return;
+    }
+
+    if (strncmp(command, "squ_", 4) == 0) {
+        bool raw = (strcmp(command + 4, "raw") == 0);
+        if (!raw && strcmp(command + 4, "mv") != 0) {
+            out.println("sq:bad, use squ_raw or squ_mv");
+            return;
+        }
+        schedSetRawUnit(raw);
+        out.printf("sq:unit, %s\n", raw ? "raw" : "mV");
+        return;
+    }
+
+    if (strcmp(command, "sqc") == 0) {
+        schedClear();
+        out.println("sq:cleared");
+        return;
+    }
+
+    /* Fire the program now: the wired trigger, where the host has a cable
+     * to each tag and writes this to all of them back to back. Over WiFi
+     * the exciter's preamble does it instead (see esyncListening()). */
+    if (strcmp(command, "sgo") == 0) {
+        if (!schedLoaded()) {
+            out.println("sq:empty, load slots with sq_mpp / sq_lis first");
+            return;
+        }
+        if (pathIsBusy()) {
+            out.println("sq:busy, stop capture/plotter first");
+            return;
+        }
+        schedRun();
+        out.println("sq:done");
+        return;
+    }
+
+    if (strcmp(command, "sqr") == 0) {
+        schedReport(out);
+        return;
+    }
+
+    if (strcmp(command, "sq") == 0) {
+        schedPrint(out);
         return;
     }
 
