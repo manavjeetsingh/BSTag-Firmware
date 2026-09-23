@@ -2,7 +2,7 @@
 
 This module answers one question: **given a captured ADC trace, which samples belong to which RF channel?**
 
-Everything downstream depends on getting that right. `cal_theta` builds its least-squares fit from one amplitude per channel, so if the windows are misplaced the channel labels are wrong, the amplitudes are attributed to the wrong reflection coefficients, and the phase comes out wrong — without anything looking broken.
+Everything downstream depends on getting that right. `cal_theta_et_al` builds its least-squares fit from one amplitude per channel, so if the windows are misplaced the channel labels are wrong, the amplitudes are attributed to the wrong reflection coefficients, and the phase comes out wrong — without anything looking broken.
 
 ---
 
@@ -184,7 +184,7 @@ from ribbn_scripts.processing.mpp_segment import segment_capture
 medians, per_channel, (start, dwell, score) = segment_capture(voltages, channels)
 ```
 
-- `medians` — `{channel: median_mV}`, the values fed to `cal_theta`
+- `medians` — `{channel: median_mV}`, the values fed to `cal_theta_et_al`
 - `per_channel` — `{channel: np.ndarray}` of the trimmed samples in each window
 - `(start, dwell, score)` — the fitted grid; `score` is the objective value, useful as a confidence signal
 

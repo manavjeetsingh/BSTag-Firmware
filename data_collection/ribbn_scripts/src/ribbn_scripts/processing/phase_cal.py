@@ -1,7 +1,7 @@
 import numpy as np
 import math
 
-def cal_theta(adcs, rxName, txName, cfg, freq):
+def cal_theta_et_al(adcs, rxName, txName, cfg, freq):
     """freq in hz"""
     amp = []
     phi = []
@@ -29,4 +29,4 @@ def cal_theta(adcs, rxName, txName, cfg, freq):
     V = out[0]
     beta = math.sqrt(out[1] * out[1] + out[2] * out[2]) 
     
-    return theta_deg
+    return theta_deg, V, beta

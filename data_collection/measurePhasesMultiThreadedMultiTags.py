@@ -6,7 +6,7 @@ import os
 import matplotlib.pyplot as plt
 import multiprocessing
 import queue as queue_mod
-from ribbn_scripts.processing.phase_cal import cal_theta
+from ribbn_scripts.processing.phase_cal import cal_theta_et_al
 from ribbn_scripts.processing.mpp_segment import segment_capture, channel_windows
 import esync_mpp
 import exciters
@@ -486,7 +486,8 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
         FREQS_DONE=[]
         columns=["Rx","Tx", "MPP Start Time (s)",
                                 "MPP Stop Time (s)","Voltages (mV)",
-                                    "Frequency (MHz)", "Run Exp Num", "MPP Repetition", "Unidirectional Phase (deg)"
+                                    "Frequency (MHz)", "Run Exp Num", "MPP Repetition", "Unidirectional Phase (deg)",
+                                    "Unidirectional V", "Unidirectional beta",
                                     "Time Taken (s)"]
         # Wireless only: how well each tag locked on the preamble.
         columns += ["Esync Rho", "Esync SNR (dB)"]
@@ -536,7 +537,7 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                             
                             # MPP processing and phase calculation
                             channel_median, channels_voltages=getChannelVoltage(_voltages, mpp_stop_time_1, mpp_start_time_1, channels=channels, plotting=False)
-                            phase_theta=cal_theta(channel_median, rxName=tag_mac_mapping[rx_tag], txName=tag_mac_mapping[tx_tag],
+                            phase_theta,V,beta=cal_theta_et_al(channel_median, rxName=tag_mac_mapping[rx_tag], txName=tag_mac_mapping[tx_tag],
                             cfg=hw_config,
                             freq=freq*1e6, #in hz
                             )
@@ -556,7 +557,9 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                                 "Run Exp Num":run_exp_num,
                                 "MPP Repetition": rep+1,
                                 "Time Taken(s)":rep_end-rep_start,
-                                "Unidirectional Phase (deg)":phase_theta
+                                "Unidirectional Phase (deg)":phase_theta,
+                                "Unidirectional V":V,
+                                "Unidirectional beta": beta,
                                 
                             }
                             rx_report=esync_reports.get(rx_tag, {})

@@ -10,7 +10,7 @@ import os
 import ast
 import pandas as pd
 
-# matches the pwr clipping (dBm, rounded) in phase_cal.cal_theta
+# matches the pwr clipping (dBm, rounded) in phase_cal.cal_theta_et_al
 
 
 def build_s11_cfg(vna_data):
