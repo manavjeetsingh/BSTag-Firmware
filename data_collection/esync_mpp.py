@@ -23,6 +23,28 @@ MAX_ROUND_ATTEMPTS = 10
 FIRE_DEADLINE_S = 15.0
 
 
+# Sweep points to drop from a wireless run: the exciter's 3rd harmonic lands
+# here on the tags' 2.4 GHz channel and jams the link for the whole round --
+# both tags go silent with their sockets still open, and no amount of retrying
+# gets a round through while the carrier is parked there. 810-820 MHz puts the
+# harmonic at 2430-2460 MHz, i.e. WiFi channels 3-12.
+#
+# Inclusive, in MHz. A low-pass filter on the exciter output is the real fix,
+# and with one fitted this can go back to (None, None). Note this covers only
+# part of the vulnerable window -- the harmonic is in-band for the whole of
+# 800-828 MHz (2400-2483.5 / 3) -- so 805 and 825 still go out, and they are
+# the ones to look at if a run dies with an AP on channel 1-3 or 12-13.
+WIFI_JAMMED_MHZ = (810.0, 820.0)
+
+
+def wifi_jammed(freq_mhz):
+    """True if this sweep point jams the tags' WiFi (see WIFI_JAMMED_MHZ)."""
+    lo, hi = WIFI_JAMMED_MHZ
+    if lo is None or hi is None:
+        return False
+    return lo <= freq_mhz <= hi
+
+
 def check_fired(reports):
     """Raise unless every tag locked on the preamble and fired.
 

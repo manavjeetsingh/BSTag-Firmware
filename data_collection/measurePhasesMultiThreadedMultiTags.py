@@ -246,8 +246,14 @@ def initialize(tag_endpoint_mapping, transport=WIRED):
 # every time is the cable or the tag, and more tries won't tell us anything new.
 MAX_WIRED_ROUND_ATTEMPTS = 3
 
+# Pause before each re-shoot, wired and wireless alike. Most of what makes a
+# round fail -- a truncated reply, a tag still draining an abandoned capture, a
+# preamble that landed on traffic -- clears on its own given a moment, and
+# re-shooting immediately tends to hit the same state again.
+RETRY_BACKOFF_S = 5.0
 
-def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
+
+def MPPMultiWays(rx_tags:list, cmdq_tx, result_q, channels):
     """One MPP round over serial, re-shot if any part of it is lost.
 
     A capture cut short -- hardware.py fails those fast rather than sitting out
@@ -255,6 +261,9 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
     cannot be asked for again: the sweep is over and the buffer is gone. So the
     whole round is re-shot, the way the wireless path does it
     (MPPMultiWaysEsync), rather than carrying a hole into the results.
+
+    Segmenting is part of the shot (see _segmentRound), so a trace that arrives
+    intact but holds no sweep is re-shot too instead of ending the run.
     """
     last = None
     for attempt in range(1, MAX_WIRED_ROUND_ATTEMPTS + 1):
@@ -263,11 +272,14 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
             # one's (same reasoning as MPPMultiWaysEsync).
             _drainResults(result_q)
         try:
-            return _mppRound(rx_tags, cmdq_tx, result_q)
+            readings, start, stop = _mppRound(rx_tags, cmdq_tx, result_q)
+            return readings, start, stop, _segmentRound(readings, channels, WIRED)
         except Exception as e:
             last = e
             print(f"  mpp: attempt {attempt}/{MAX_WIRED_ROUND_ATTEMPTS} "
-                  f"failed, re-shooting: {e}")
+                  f"failed, re-shooting in {RETRY_BACKOFF_S:g}s: {e}")
+            if attempt < MAX_WIRED_ROUND_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_S)
 
     raise Exception(f"MPP round failed on all {MAX_WIRED_ROUND_ATTEMPTS} "
                     f"attempts. Last: {last}")
@@ -332,29 +344,61 @@ def _gather(result_q, res_type, tags, timeout):
     return got
 
 
-def MPPMultiWaysEsync(rx_tags, tx_tag, exc, result_q):
+def MPPMultiWaysEsync(rx_tags, tx_tag, exc, result_q, channels):
     """One MPP round started by the exciter's preamble instead of the host.
 
     Any failure drops the whole round and re-shoots it, up to
     MAX_ROUND_ATTEMPTS; nothing from a failed shot is kept. Leftover answers
     from the failed shot are drained first, or the next _gather() would read
     them as its own.
+
+    Segmenting is part of the shot (see _segmentRound), so a trace that locked
+    and arrived but holds no sweep is re-shot too instead of ending the run.
     """
     last = None
     for attempt in range(1, esync_mpp.MAX_ROUND_ATTEMPTS + 1):
         if attempt > 1:
             _drainResults(result_q)
         try:
-            return _esyncRound(rx_tags, tx_tag, exc, result_q)
+            readings, start, stop, reports = _esyncRound(
+                rx_tags, tx_tag, exc, result_q)
+            return (readings, start, stop, reports,
+                    _segmentRound(readings, channels, WIRELESS))
         except Exception as e:
             last = e
             print(f"  sync: attempt {attempt}/{esync_mpp.MAX_ROUND_ATTEMPTS} "
-                  f"failed, re-shooting: {e}")
+                  f"failed, re-shooting in {RETRY_BACKOFF_S:g}s: {e}")
+            if attempt < esync_mpp.MAX_ROUND_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF_S)
 
     raise Exception(
         f"esync round failed on all {esync_mpp.MAX_ROUND_ATTEMPTS} attempts. "
         f"A failure this consistent is the setup, not the shot -- see peak_rho "
         f"in esync_mpp.check_fired(). Last: {last}")
+
+
+def _segmentRound(voltage_readings, channels, transport):
+    """Segment every receiver's trace, or fail the whole round.
+
+    `transport` reaches mpp_segment as the dwell length in samples, which is
+    not the same on the two: it is the caller that knows which round this was
+    (MPPMultiWays is the wired one, MPPMultiWaysEsync the wireless one).
+
+    Segmenting used to happen back in mainMultiWays, past the re-shoot loops,
+    so a capture that came back whole but held no recoverable sweep -- a short
+    trace, a tag that never actually swept -- raised out of the run and ended
+    it, even though that is exactly the kind of shot a re-try tends to fix.
+    Doing it here makes an unsegmentable trace just another failed shot.
+    """
+    segments = {}
+    for tag_id, trace in voltage_readings.items():
+        try:
+            segments[tag_id] = getChannelVoltage(
+                trace, None, None, channels=channels, plotting=False,
+                transport=transport)
+        except Exception as e:
+            raise Exception(f"could not segment the capture from tag {tag_id}: {e}")
+    return segments
 
 
 def _drainResults(result_q):
@@ -414,15 +458,20 @@ def _esyncRound(rx_tags, tx_tag, exc, result_q):
     return voltage_readings, mpp_start_time, mpp_stop_time, reports
 
 
-def getChannelVoltage(voltage_readings, mpp_stop_time, mpp_start_time, channels,plotting=False):
+def getChannelVoltage(voltage_readings, mpp_stop_time, mpp_start_time, channels,plotting=False,
+                      *, transport):
     """Segment a capture into its per-channel dwells.
 
     mpp_stop_time/mpp_start_time are kept for the caller's bookkeeping but are
     deliberately not used to place the boundaries -- see mpp_segment for why
     host wall-clock timing mislabels ~half of all captures.
+
+    `transport` is keyword-only and has no default: it picks the dwell length
+    the fit looks for, and the wrong one silently misplaces every window.
     """
     plot_voltage=np.asarray(voltage_readings)
-    channel_medians,channel_voltages,(start,dwell,score)=segment_capture(plot_voltage, channels)
+    channel_medians,channel_voltages,(start,dwell,score)=segment_capture(plot_voltage, channels,
+                                                                         transport=transport)
 
     if plotting:
         plt.figure(figsize=(20,10))
@@ -450,6 +499,26 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                   transport=WIRED,
                   exciter_settings=None):
     global cmd_qs, result_q, processes
+
+    if transport == WIRELESS:
+        # Wireless only: these points jam the tags' own WiFi, so they cannot be
+        # measured over it at all (see esync_mpp.WIFI_JAMMED_MHZ). A wired run
+        # has no link to lose and sweeps them normally.
+        jammed = [f for f in freq_range if esync_mpp.wifi_jammed(f)]
+        if jammed:
+            freq_range = [f for f in freq_range
+                          if not esync_mpp.wifi_jammed(f)]
+            lo, hi = esync_mpp.WIFI_JAMMED_MHZ
+            print(f"skipping {jammed} MHz: {lo:g}-{hi:g} MHz jams the tags' "
+                  f"WiFi over the air, so a wireless run cannot reach them. "
+                  f"Run them with CONNECTION: wired.")
+        if not freq_range:
+            raise Exception(
+                f"every frequency asked for is inside "
+                f"esync_mpp.WIFI_JAMMED_MHZ {esync_mpp.WIFI_JAMMED_MHZ}, so a "
+                f"wireless run has nothing left to sweep. Use CONNECTION: "
+                f"wired for these, or fit a low-pass filter and clear the "
+                f"band.")
 
     exciter_type = exciters.normalize(exciter_type)
     exc = exciters.make_exciter(exciter_type, **(exciter_settings or {}))
@@ -488,7 +557,12 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                                 "MPP Stop Time (s)","Voltages (mV)",
                                     "Frequency (MHz)", "Run Exp Num", "MPP Repetition", "Unidirectional Phase (deg)",
                                     "Unidirectional V", "Unidirectional beta",
-                                    "Time Taken (s)"]
+                                    "Time Taken (s)",
+                                    # Which CONNECTION captured these traces. Re-segmenting
+                                    # them later needs it (mpp_segment.DWELL_SAMPLES), and
+                                    # without it in the file post_processing.py has nothing
+                                    # to go on but a command-line flag.
+                                    "Connection"]
         # Wireless only: how well each tag locked on the preamble.
         columns += ["Esync Rho", "Esync SNR (dB)"]
         for ch in channels:
@@ -525,18 +599,22 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                         esync_reports={}
                         if transport == WIRELESS:
                             (voltage_readings_1, mpp_start_time_1,
-                             mpp_stop_time_1, esync_reports)=MPPMultiWaysEsync(
+                             mpp_stop_time_1, esync_reports,
+                             segments_1)=MPPMultiWaysEsync(
                                 rx_tags=rx_tags, tx_tag=tx_tag,
-                                exc=exc, result_q=result_q)
+                                exc=exc, result_q=result_q, channels=channels)
                             print(f"  sync: {esync_mpp.sync_summary(esync_reports)}")
                         else:
-                            voltage_readings_1, mpp_start_time_1, mpp_stop_time_1=MPPMultiWays(rx_tags=rx_tags, cmdq_tx=tx_queue, result_q=result_q)
+                            voltage_readings_1, mpp_start_time_1, mpp_stop_time_1, segments_1=MPPMultiWays(rx_tags=rx_tags, cmdq_tx=tx_queue, result_q=result_q, channels=channels)
                         rep_end=time.time()
                         for rx_tag in rx_tags:
                             _voltages=voltage_readings_1[int(rx_tag[3:])]
                             
-                            # MPP processing and phase calculation
-                            channel_median, channels_voltages=getChannelVoltage(_voltages, mpp_stop_time_1, mpp_start_time_1, channels=channels, plotting=False)
+                            # MPP processing and phase calculation. The
+                            # segmenting already happened inside the round, so
+                            # a trace that cannot be segmented was re-shot
+                            # rather than landing here.
+                            channel_median, channels_voltages=segments_1[int(rx_tag[3:])]
                             phase_theta,V,beta=cal_theta_et_al(channel_median, rxName=tag_mac_mapping[rx_tag], txName=tag_mac_mapping[tx_tag],
                             cfg=hw_config,
                             freq=freq*1e6, #in hz
@@ -560,6 +638,7 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
                                 "Unidirectional Phase (deg)":phase_theta,
                                 "Unidirectional V":V,
                                 "Unidirectional beta": beta,
+                                "Connection":transport,
                                 
                             }
                             rx_report=esync_reports.get(rx_tag, {})

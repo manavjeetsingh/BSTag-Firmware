@@ -17,6 +17,14 @@
 
 #define TCP_PORT               3333
 #define MAX_TCP_CLIENTS        2
+/* How long serviceWifi() lets the link stay down before it forces a fresh
+ * WiFi.begin(). The Arduino core retries on its own after a disconnect, but
+ * only for the reasons in its _is_staReconnectableReason() -- an AUTH_FAIL
+ * after the first attempt, or an ASSOC_LEAVE, leaves the STA down with
+ * nothing left to bring it back, and nothing else in the firmware calls
+ * begin() again. Without this the tag sits there with no IP and no TCP
+ * server until it is power cycled. The "net" command counts them as
+ * "retries". */
 #define WIFI_RETRY_MS          5000
 #define WIFI_LOW_LATENCY       1      /* 1 = disable modem sleep (more power) */
 
@@ -39,6 +47,29 @@
  * silently misbehaving. */
 #define WIFI_FAST_RESUME       1
 #define WIFI_FAST_RESUME_MS    1500
+
+/* The same trick applied to the boot join. WiFi.persistent(false) in
+ * wifiStart() keeps the driver out of NVS on every begin(), which also
+ * means nothing about the last AP survives a reset: every boot re-scans all
+ * of 2.4 GHz before it can even authenticate, and the TCP server does not
+ * open until that has finished and DHCP has answered. (Dropping
+ * persistent(false) would not fix it -- the core memsets the channel and
+ * BSSID out of wifi_config_t on every begin() regardless, so the driver's
+ * own stored hint is overwritten before it can be used.) The hint is kept
+ * here instead: net.cpp saves the BSSID and channel it associated on, once
+ * per AP rather than once per join, and starts the next boot on that
+ * channel.
+ *
+ * Unlike a resume this does NOT reuse the address -- a lease is fair to
+ * assume across the milliseconds of a suspend, not across however long the
+ * tag was powered off -- so the boot still goes through DHCP and
+ * WIFI_FAST_JOIN_MS has to leave room for it. Keep it under WIFI_RETRY_MS
+ * so the fallback gets its turn before the retry timer does.
+ *
+ * Fails soft the same way: an AP that moved channel costs one slow join and
+ * a "fast":"fallback" notice, then the hint is dropped and relearned. */
+#define WIFI_FAST_JOIN         1
+#define WIFI_FAST_JOIN_MS      4000
 
 /* XIAO ESP32-C6 pin mapping by physical XIAO header position. */
 #define PIN_RF_V1              20   /* D9 */

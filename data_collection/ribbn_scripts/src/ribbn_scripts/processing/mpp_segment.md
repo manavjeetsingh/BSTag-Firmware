@@ -14,7 +14,7 @@ During `perform_mpp()` the transmitting tag steps through `MPP_CHANNELS` from `a
 static const uint8_t MPP_CHANNELS[] = {1, 1, 1, 1,  3, 4, 6, 7, 8};
 ```
 
-Nine dwells, 27 ms total. Note ch1 appears **four times**. Meanwhile the receiving tag is parked on `CAPTURE_CHANNEL` and free-running its ADC at ~66.7 kSa/s, so one 3 ms dwell is **200 samples**.
+Nine dwells, 27 ms total. Note ch1 appears **four times**. Meanwhile the receiving tag is parked on `CAPTURE_CHANNEL` and free-running its ADC, so one 3 ms dwell is some fixed number of samples — see `DWELL_SAMPLES`, which is **45 on a wireless run and 70 on a wired one**. The two differ because the sample loop does: a wireless capture keeps the radio up, and the WiFi and lwIP tasks outrank `loopTask`, so fewer samples land in the same 3 ms.
 
 A capture therefore looks like this, with variable lead-in and tail around the sweep:
 
@@ -169,10 +169,11 @@ Recorded so they are not re-attempted:
 |---|---|
 | At least some adjacent channels differ measurably | If two adjacent channels reflect near-identically, that boundary contributes nothing to term (A) and the fit leans on the remaining four. The wall-clock method fails such cases too. |
 | `MPP_CHANNELS` begins with repeated ch1 | Term (B) becomes invalid. If the firmware's channel list changes, this module must change with it. |
-| Dwell ≈ `DWELL_SAMPLES` ±3% | A larger shift in the ADC loop rate needs `DWELL_SAMPLES` or `DWELL_TOLERANCE` updated. |
+| Dwell ≈ `DWELL_SAMPLES[transport]` ±3% | A larger shift in the ADC loop rate needs `DWELL_SAMPLES` or `DWELL_TOLERANCE` updated. |
+| The caller passes the right `transport` | Centring the search on the other mode's dwell puts it outside the ±3% window, so the fit lands on a wrong grid. The live pipeline passes it from which round function ran; offline, `post_processing.py --transport` supplies it, since the CSV does not record it. |
 | The trace contains ≥ 7 dwells | Raises `ValueError`; shorter captures cannot be segmented. |
 
-`DWELL_SAMPLES` is coupled to two firmware facts — `MPP_DWELL_US` in `config.h` and the ADC loop rate. Nothing checks that coupling automatically, so if either changes, the symptom is silently misaligned windows.
+`DWELL_SAMPLES` is coupled to two firmware facts — `MPP_DWELL_US` in `config.h` and the ADC loop rate, the latter being why there is one entry per transport. Nothing checks that coupling automatically, so if either changes, the symptom is silently misaligned windows.
 
 ---
 
@@ -181,14 +182,16 @@ Recorded so they are not re-attempted:
 ```python
 from ribbn_scripts.processing.mpp_segment import segment_capture
 
-medians, per_channel, (start, dwell, score) = segment_capture(voltages, channels)
+medians, per_channel, (start, dwell, score) = segment_capture(voltages, channels, transport="wireless")
 ```
 
 - `medians` — `{channel: median_mV}`, the values fed to `cal_theta_et_al`
 - `per_channel` — `{channel: np.ndarray}` of the trimmed samples in each window
 - `(start, dwell, score)` — the fitted grid; `score` is the objective value, useful as a confidence signal
 
-Lower-level entry points: `fit_sweep_grid(voltages, n_measured)` returns `(start, dwell, score)` alone, and `channel_windows(start, dwell, channels)` maps those to `{channel: (lo, hi)}` sample indices.
+- `transport` — the run's `CONNECTION`, `"wireless"` (the default) or `"wired"`. It only picks which `DWELL_SAMPLES` the search is centred on; the `dwell` that comes back is still measured from the trace.
+
+Lower-level entry points: `fit_sweep_grid(voltages, n_measured, transport)` returns `(start, dwell, score)` alone, and `channel_windows(start, dwell, channels)` maps those to `{channel: (lo, hi)}` sample indices.
 
 ### Callers
 

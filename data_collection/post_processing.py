@@ -49,7 +49,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import pandas as pd
 
-from ribbn_scripts.processing.mpp_segment import segment_capture, channel_windows
+from ribbn_scripts.processing.mpp_segment import segment_capture, channel_windows, DWELL_SAMPLES
 
 # dataviz categorical palette (references/palette.md), light-mode steps
 CATEGORICAL_COLORS = [
@@ -122,14 +122,60 @@ def parse_float_array(text: str) -> np.ndarray:
         return np.asarray([float(v) for v in re.split(r"[\s,]+", text.strip("[] \n"))])
 
 
-def segment_trace(voltages: np.ndarray, elapsed: float, channels: list):
+CONNECTION_COL = "Connection"
+
+
+def resolve_transport(csv_path: str, override: str = None) -> str:
+    """The CONNECTION a CSV was captured over.
+
+    Runs record it in the CSV now, so that is the source of truth and nothing
+    has to be remembered at the command line. `override` still wins, for the
+    older files that predate the column -- and if it disagrees with what the
+    file says, that is worth a word, since one of the two is wrong.
+
+    Nothing is guessed. Defaulting to either mode is what put misplaced
+    windows in the plots: the dwell searches do not overlap (see
+    mpp_segment.DWELL_SAMPLES), so the wrong one is not a near miss.
+    """
+    recorded = None
+    try:
+        col = pd.read_csv(csv_path, usecols=[CONNECTION_COL])[CONNECTION_COL]
+        values = sorted({str(v) for v in col.dropna().unique()})
+        if len(values) > 1:
+            raise SystemExit(
+                f"{csv_path} mixes connections {values}; split it before "
+                f"plotting, the two need different dwell lengths")
+        recorded = values[0] if values else None
+    except ValueError:
+        pass        # older CSV, no such column
+
+    if override is not None:
+        if recorded is not None and override != recorded:
+            print(f"warning: --transport {override!r} overrides the {recorded!r} "
+                  f"recorded in {csv_path}", file=sys.stderr)
+        return override
+    if recorded is not None:
+        return recorded
+    raise SystemExit(
+        f"{csv_path} does not record its CONNECTION (it predates the column), "
+        f"so the dwell length to segment with is unknown. Pass --transport "
+        f"{{{','.join(sorted(DWELL_SAMPLES))}}}.")
+
+
+def segment_trace(voltages: np.ndarray, elapsed: float, channels: list,
+                  *, transport: str):
     """Locate the channel dwells, using the same fit as the live pipeline.
 
     Returns a time axis for the complete trace, the boundary positions and
     (channel, left, right, median) per segment -- all in seconds, so `elapsed`
     is used only to scale the axis for display, never to place the boundaries.
+
+    `transport` is the CONNECTION the run was captured over; getting it wrong
+    centres the dwell search on the other mode's length and the windows come
+    out misplaced. resolve_transport() reads it off the CSV.
     """
-    medians, per_channel, (start, dwell, _) = segment_capture(voltages, channels)
+    medians, per_channel, (start, dwell, _) = segment_capture(voltages, channels,
+                                                              transport=transport)
 
     dt = elapsed / len(voltages)
     time = np.arange(len(voltages)) * dt
@@ -142,7 +188,8 @@ def segment_trace(voltages: np.ndarray, elapsed: float, channels: list):
     return time, ver_lines, segments
 
 
-def plot_voltage_traces(csv_path: str, n_runs: int, output_path: str, freq: float = None) -> None:
+def plot_voltage_traces(csv_path: str, n_runs: int, output_path: str, freq: float = None,
+                        *, transport: str) -> None:
     df = pd.read_csv(csv_path)
     channels = sorted(
         int(c.split("_")[1]) for c in df.columns if c.startswith("Channel_") and c.endswith("_median")
@@ -176,7 +223,8 @@ def plot_voltage_traces(csv_path: str, n_runs: int, output_path: str, freq: floa
                     plt.close(fig)
                     return
                 elapsed = row["MPP Stop Time (s)"] - row["MPP Start Time (s)"]
-                time, ver_lines, segments = segment_trace(voltages, elapsed, channels)
+                time, ver_lines, segments = segment_trace(voltages, elapsed, channels,
+                                                          transport=transport)
 
                 ax.plot(time, voltages, ".", markersize=2, color=CATEGORICAL_COLORS[0], label="ADC samples")
                 # everything outside the fitted sweep window is unused
@@ -300,6 +348,11 @@ def main():
                         help="Plot voltage traces for the first N run exp numbers (default: 1)")
     parser.add_argument("--freq", type=float, default=None,
                         help="Only include this frequency's rows (MHz) in the voltage-traces PDF (default: all frequencies)")
+    parser.add_argument("--transport", default=None, choices=sorted(DWELL_SAMPLES),
+                        help="CONNECTION the run was captured over. Sets the dwell length the "
+                             "sweep fit looks for, which differs between the two. Taken from the "
+                             "CSV's Connection column by default; pass this for files that "
+                             "predate it, or to override what they say")
     parser.add_argument("--distance", type=float, default=None,
                         help="Tag-to-tag distance in meters. If given and the CSV has exactly two unique tags, "
                              "overlay the theoretical phase (2*pi*f*d/c mod pi) on the combined phase plot")
@@ -352,7 +405,8 @@ def main():
         )
 
     pdf_suffix = f"_voltage_traces_{args.freq:g}MHz.pdf" if args.freq is not None else "_voltage_traces.pdf"
-    plot_voltage_traces(args.csv_path, args.runs, base + pdf_suffix, freq=args.freq)
+    plot_voltage_traces(args.csv_path, args.runs, base + pdf_suffix, freq=args.freq,
+                        transport=resolve_transport(args.csv_path, args.transport))
 
 
 if __name__ == "__main__":

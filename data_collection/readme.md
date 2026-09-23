@@ -41,6 +41,20 @@
   belongs to the exciter a run is using -- moving `EXCITER` without moving
   `EXC_POWER` changes the carrier.
 
+## A wireless run skips 810-820 MHz
+
+The exciter's 3rd harmonic lands on the tags' 2.4 GHz channel there (3 x 815 =
+2445 MHz, WiFi channels 6-9), and a carrier parked on it jams both tags for the
+whole round: they go silent with their sockets still open, and every re-shoot
+fails the same way. `mainMultiWays` drops those points from a `CONNECTION:
+wireless` sweep and says so; the band is `esync_mpp.WIFI_JAMMED_MHZ`.
+
+Wired runs sweep them normally -- there is no link to lose -- so that is where
+to measure them. The harmonic is actually in-band across all of 800-828 MHz
+(2400-2483.5 / 3), so 805 and 825 are the next suspects if a run dies with the
+AP on channel 1-3 or 12-13. A low-pass filter on the exciter output clears the
+whole question, and `WIFI_JAMMED_MHZ = (None, None)` then turns the skip off.
+
 ## A cut-short reply fails the round instead of hanging on it
 
 Every reply the tag sends is one line, and the read loops in `hardware.py`
