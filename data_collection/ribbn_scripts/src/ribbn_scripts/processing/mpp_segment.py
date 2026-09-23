@@ -14,7 +14,7 @@ instead, and the wall-clock timing is not used at all.
 
 import numpy as np
 
-DWELL_SAMPLES = 200      # MPP_DWELL_US (3ms) at the tag's ~66.7kSa/s sample loop
+DWELL_SAMPLES = 75      # MPP_DWELL_US (3ms) at the tag's ~66.7kSa/s sample loop
 DWELL_TOLERANCE = 0.03   # absorbs small drift in that loop rate
 N_PAD = 4                # leading ch1 dwells in MPP_CHANNELS
 EDGE_TRIM = 8            # samples either side of a switch, which catch the transition

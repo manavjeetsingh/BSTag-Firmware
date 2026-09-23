@@ -1,7 +1,7 @@
 {
-    "CONNECTION": "wireless",
+    "CONNECTION": "wired",
     "EXCITER": "bladerf",
-    "EXC_POWER": 12.9,
+    "EXC_POWER": 35,
     "MPP_REPETITIONS": 1,
     "FREQ_MIN": 775,
     "FREQ_MAX": 995,

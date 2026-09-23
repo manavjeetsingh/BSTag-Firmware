@@ -229,7 +229,40 @@ def initialize(tag_endpoint_mapping, transport=WIRED):
         p.start()
     
 
+# Re-shoots per wired MPP round before the run gives up. A capture that comes
+# back cut short (hardware.TruncatedReply) is worth another shot; one that fails
+# every time is the cable or the tag, and more tries won't tell us anything new.
+MAX_WIRED_ROUND_ATTEMPTS = 3
+
+
 def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
+    """One MPP round over serial, re-shot if any part of it is lost.
+
+    A capture cut short -- hardware.py fails those fast rather than sitting out
+    its 60 s timeout -- or any other worker error answers None, and that capture
+    cannot be asked for again: the sweep is over and the buffer is gone. So the
+    whole round is re-shot, the way the wireless path does it
+    (MPPMultiWaysEsync), rather than carrying a hole into the results.
+    """
+    last = None
+    for attempt in range(1, MAX_WIRED_ROUND_ATTEMPTS + 1):
+        if attempt > 1:
+            # Answers from the failed shot would otherwise be read as this
+            # one's (same reasoning as MPPMultiWaysEsync).
+            _drainResults(result_q)
+        try:
+            return _mppRound(rx_tags, cmdq_tx, result_q)
+        except Exception as e:
+            last = e
+            print(f"  mpp: attempt {attempt}/{MAX_WIRED_ROUND_ATTEMPTS} "
+                  f"failed, re-shooting: {e}")
+
+    raise Exception(f"MPP round failed on all {MAX_WIRED_ROUND_ATTEMPTS} "
+                    f"attempts. Last: {last}")
+
+
+def _mppRound(rx_tags, cmdq_tx, result_q):
+    """One shot: start the receivers capturing, sweep, collect."""
     global cmd_qs
 
     for rx_tag in rx_tags:
@@ -244,6 +277,10 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
             if data is not None:
                 mpp_start_time, mpp_stop_time = data
             mpp_done = True
+    if mpp_start_time is None:
+        # The tx tag never swept, so whatever the receivers captured is of
+        # nothing. Fail the round instead of segmenting a flat trace.
+        raise Exception("perform_mpp failed on the tx tag")
     for rx_tag in rx_tags:
         cmd_qs[rx_tag].put("stop_reading")
     voltage_readings = {}
@@ -251,6 +288,9 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
         tag_id, res_type, data = result_q.get()
         if res_type == "voltage_readings":
             voltage_readings[tag_id] = data
+    failed = [t for t, v in voltage_readings.items() if v is None]
+    if failed:
+        raise Exception(f"capture failed on tag(s) {sorted(failed)}")
     # print("MPP DONE WITH TAGS:",len(voltage_readings))
     return voltage_readings, mpp_start_time, mpp_stop_time
 
