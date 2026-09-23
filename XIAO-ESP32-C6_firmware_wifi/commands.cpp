@@ -167,9 +167,11 @@ void runQueuedCommand(void)
         return;
     }
 
-    /* No session left -- almost always because the esync window took the
-     * radio down. Capture the reply so qr can hand it over once the host
-     * is back, instead of writing it into a closed socket. */
+    /* No session left -- the staging client dropped, or it was staged over
+     * Serial before a reset. Capture the reply so qr can hand it over once a
+     * host is back, instead of writing it into a closed socket. (The esync
+     * window no longer closes sessions, so its replies take the branch
+     * above.) */
     clearQueuedReply();
     strncpy(reply_for, cmd, sizeof(reply_for) - 1);
     reply_for[sizeof(reply_for) - 1] = '\0';

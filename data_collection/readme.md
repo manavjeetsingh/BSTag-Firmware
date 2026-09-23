@@ -41,6 +41,23 @@
   belongs to the exciter a run is using -- moving `EXCITER` without moving
   `EXC_POWER` changes the carrier.
 
+## A cut-short reply fails the round instead of hanging on it
+
+Every reply the tag sends is one line, and the read loops in `hardware.py`
+accumulate bytes until a `{...}` blob parses. When bytes go missing -- the
+closing brace never comes -- there is nothing to wait for, so they no longer
+wait: a line that ended without a parseable blob, a session the tag has closed,
+or a blob that goes quiet for `PARTIAL_REPLY_IDLE_S` (5 s) all raise
+`TruncatedReply` at once rather than sitting out the read's timeout (60 s for a
+10000-sample dump).
+
+Nothing can be salvaged at that point -- the sweep is over and the tag's buffer
+is gone -- so the round is re-shot from the start: `MAX_ROUND_ATTEMPTS` (10)
+wireless, `MAX_WIRED_ROUND_ATTEMPTS` (3) wired. A round is also re-shot when
+`perform_mpp` or a capture answers nothing at all, so a partial round never
+reaches the CSV. Each re-shoot prints its reason; a round that fails every
+attempt raises with the last one.
+
 ## Wireless MPP is synced off the exciter
 
 Over WiFi the host cannot start the tags together closely enough for a 3 ms
@@ -55,8 +72,9 @@ the preamble ends. Per MPP round (`MPPMultiWaysEsync`):
 2. Arm — `esync` on every tag, then `ARM_SETTLE_S` (1 s) so every radio is
    down and every correlator has a full preamble's worth of carrier.
 3. Sync — `exc.sync()` sends one preamble.
-4. Collect — reconnecting is the wait: the firmware keeps WiFi down until the
-   queued capture finishes. Then `qr`, `esyncr`, and `rds` (the trace).
+4. Collect — waiting for the fired reply is the wait, on the session that
+   stayed up: the plain line `rdb` from an Rx tag, the `mpp` blob from the Tx
+   tag, bounded by `FIRE_DEADLINE_S`. Then `esyncr`, and `rds` (the trace).
 5. Check — every tag's `esyncr` must show a lock (`rho`). Any failure drops
    the round and re-shoots it from step 1, up to `MAX_ROUND_ATTEMPTS` (10).
 

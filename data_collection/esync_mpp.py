@@ -7,19 +7,20 @@ BladeRFCode/ASK_sync/README.md). The sequence is _esyncRound() in
 measurePhasesMultiThreadedMultiTags.py; this holds its timing and checks.
 """
 
-ESYNC_WIFI_TIMEOUT_MS = 30000   # == the firmware's config.h: it gives up and
-                                # brings WiFi back after this long unsynced
-
-# After the last arm ack, before the preamble. The tag needs ESYNC_WIFI_QUIET_MS
-# (50 ms) to take its radio down and 26 ms of carrier to fill the correlator;
-# a preamble sent before that is simply never heard. The rest is margin.
-ARM_SETTLE_S = 1.0
+# After the last arm ack, before the preamble. The tag needs 26 ms of carrier
+# to fill the correlator; a preamble sent before that is simply never heard.
+# The rest is margin. (It used to have to cover the radio going down too.)
+ARM_SETTLE_S = 0.3
 
 # Re-shoots per MPP round before the run gives up. A missed preamble (a burst
 # landing on it) is worth retrying; one that misses every time is the setup.
 MAX_ROUND_ATTEMPTS = 10
 
-RECONNECT_DEADLINE_S = ESYNC_WIFI_TIMEOUT_MS / 1000.0 + 30.0
+# How long a tag waits for the preamble to fire its staged command, which is
+# now a wait on the live socket rather than on the radio coming back. The
+# exciter keys the preamble within ARM_SETTLE_S of the last arm, so past a few
+# seconds it was not heard and the round is better re-shot than waited on.
+FIRE_DEADLINE_S = 15.0
 
 
 def check_fired(reports):

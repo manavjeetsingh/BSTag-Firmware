@@ -57,7 +57,7 @@ def tag_ops(tag_instance, transport):
             "reflect": tag_instance.reflect_wifi,
             "disconnect": tag_instance.disconnect_wifi,
             # esync: staged here, fired by the exciter's preamble, collected
-            # once the radio is back. Wired runs don't need it.
+            # over the same session. Wired runs don't need it.
             "stage_mpp": lambda: tag_instance.queue_mpp_wifi(1),
             "stage_capture": tag_instance.queue_capture_wifi,
             "arm_esync": tag_instance.listen_esync_wifi,
@@ -85,15 +85,27 @@ def _reset_esync(tag_instance):
 
 
 def _collect_esync(tag_instance, want_trace):
-    """Pick up what a tag did while its radio was down.
+    """Pick up what the preamble fired, over the session that stayed up.
 
-    Reconnecting is the wait: the firmware keeps WiFi down until the queued
-    capture is done. Rx tags staged rdb, whose qr ack is the plain line
-    "rdb"; the trace then comes over the live socket with rds, shaped exactly
+    Waiting for the fired reply is the wait for the sync: an Rx tag staged rdb
+    and answers the plain line "rdb", the Tx tag staged mpp_1 and answers its
+    JSON. The trace then comes over the same socket with rds, shaped exactly
     like a wired capture.
+
+    A window that hears no preamble never answers, so the wait is bounded. On
+    a timeout the tag is disarmed and its report fetched anyway -- that report
+    is what carries peak_rho into check_fired()'s message -- and the round is
+    failed by the "queued": None below.
     """
-    tag_instance.reconnect_wifi(deadline_s=esync_mpp.RECONNECT_DEADLINE_S)
-    queued = tag_instance.fetch_queued_wifi(ack="rdb" if want_trace else None)
+    ack = "rdb" if want_trace else None
+    try:
+        queued = tag_instance.await_fired_wifi(
+            ack=ack, timeout=esync_mpp.FIRE_DEADLINE_S)
+    except Exception:
+        _reset_esync(tag_instance)
+        return {"queued": None,
+                "report": tag_instance.esync_report_wifi(),
+                "trace": None}
     report = tag_instance.esync_report_wifi()
     trace = tag_instance.stop_reading_wifi() if want_trace else None
     return {"queued": queued, "report": report, "trace": trace}
@@ -229,7 +241,40 @@ def initialize(tag_endpoint_mapping, transport=WIRED):
         p.start()
     
 
+# Re-shoots per wired MPP round before the run gives up. A capture that comes
+# back cut short (hardware.TruncatedReply) is worth another shot; one that fails
+# every time is the cable or the tag, and more tries won't tell us anything new.
+MAX_WIRED_ROUND_ATTEMPTS = 3
+
+
 def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
+    """One MPP round over serial, re-shot if any part of it is lost.
+
+    A capture cut short -- hardware.py fails those fast rather than sitting out
+    its 60 s timeout -- or any other worker error answers None, and that capture
+    cannot be asked for again: the sweep is over and the buffer is gone. So the
+    whole round is re-shot, the way the wireless path does it
+    (MPPMultiWaysEsync), rather than carrying a hole into the results.
+    """
+    last = None
+    for attempt in range(1, MAX_WIRED_ROUND_ATTEMPTS + 1):
+        if attempt > 1:
+            # Answers from the failed shot would otherwise be read as this
+            # one's (same reasoning as MPPMultiWaysEsync).
+            _drainResults(result_q)
+        try:
+            return _mppRound(rx_tags, cmdq_tx, result_q)
+        except Exception as e:
+            last = e
+            print(f"  mpp: attempt {attempt}/{MAX_WIRED_ROUND_ATTEMPTS} "
+                  f"failed, re-shooting: {e}")
+
+    raise Exception(f"MPP round failed on all {MAX_WIRED_ROUND_ATTEMPTS} "
+                    f"attempts. Last: {last}")
+
+
+def _mppRound(rx_tags, cmdq_tx, result_q):
+    """One shot: start the receivers capturing, sweep, collect."""
     global cmd_qs
 
     for rx_tag in rx_tags:
@@ -244,6 +289,10 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
             if data is not None:
                 mpp_start_time, mpp_stop_time = data
             mpp_done = True
+    if mpp_start_time is None:
+        # The tx tag never swept, so whatever the receivers captured is of
+        # nothing. Fail the round instead of segmenting a flat trace.
+        raise Exception("perform_mpp failed on the tx tag")
     for rx_tag in rx_tags:
         cmd_qs[rx_tag].put("stop_reading")
     voltage_readings = {}
@@ -251,6 +300,9 @@ def MPPMultiWays(rx_tags:list, cmdq_tx, result_q):
         tag_id, res_type, data = result_q.get()
         if res_type == "voltage_readings":
             voltage_readings[tag_id] = data
+    failed = [t for t, v in voltage_readings.items() if v is None]
+    if failed:
+        raise Exception(f"capture failed on tag(s) {sorted(failed)}")
     # print("MPP DONE WITH TAGS:",len(voltage_readings))
     return voltage_readings, mpp_start_time, mpp_stop_time
 
@@ -316,8 +368,8 @@ def _drainResults(result_q):
 def _esyncRound(rx_tags, tx_tag, exc, result_q):
     """One shot: stage, arm, sync, collect.
 
-    Everything is staged before anything is armed, because `esync` takes the
-    radio down ESYNC_WIFI_QUIET_MS after acking and a later q_ never lands.
+    Everything is staged before anything is armed: an armed tag can lock on
+    the next preamble it hears, and a lock with an empty slot fires nothing.
     """
     all_tags = [tx_tag] + list(rx_tags)
 
@@ -330,8 +382,9 @@ def _esyncRound(rx_tags, tx_tag, exc, result_q):
         cmd_qs[tag].put("esync_arm")
     _gather(result_q, "esync_armed", all_tags, timeout=30)
 
-    # Radios down and correlators primed before the preamble -- and before the
-    # collects start, or they reconnect to the old socket before it closes.
+    # Correlators primed with carrier before the preamble, and the collects
+    # posted before it too, so every tag is already reading its socket when
+    # its fired reply lands there.
     time.sleep(esync_mpp.ARM_SETTLE_S)
 
     cmd_qs[tx_tag].put("esync_collect_tx")
@@ -341,13 +394,20 @@ def _esyncRound(rx_tags, tx_tag, exc, result_q):
     mpp_start_time, mpp_stop_time = exc.sync()
 
     results = _gather(result_q, "esync_result", all_tags,
-                      timeout=esync_mpp.RECONNECT_DEADLINE_S + 60)
+                      timeout=esync_mpp.FIRE_DEADLINE_S + 60)
     failed = [t for t, r in results.items() if r is None]
     if failed:
         raise Exception(f"esync collect failed on tag(s) {sorted(failed)}")
 
     reports = {f"Tag{tag_id}": r["report"] for tag_id, r in results.items()}
     esync_mpp.check_fired(reports)
+
+    # check_fired() goes first: a tag that never locked explains itself with
+    # peak_rho. Reaching here means it locked but its reply never arrived.
+    no_reply = [t for t, r in results.items() if r["queued"] is None]
+    if no_reply:
+        raise Exception(f"locked but no fired reply from tag(s) "
+                        f"{sorted(no_reply)}")
 
     voltage_readings = {tag_id: r["trace"]
                         for tag_id, r in results.items() if r["trace"] is not None}

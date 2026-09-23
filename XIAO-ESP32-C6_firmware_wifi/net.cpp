@@ -257,8 +257,8 @@ void printNetStatus(Print &out)
 
 /* WiFi/TCP compiled out. Every entry point below stays, as a no-op or a
  * fixed status, so callers in the .ino and commands.cpp need no #ifdef of
- * their own -- in particular esync's wifiSuspend()/wifiResume() calls and
- * loop()'s wifiSuspended() poll are unconditional. */
+ * their own -- in particular commands.cpp's wifi_off/wifi_on still call
+ * wifiSuspend()/wifiResume() unconditionally. */
 
 void wifiStart(void)
 {

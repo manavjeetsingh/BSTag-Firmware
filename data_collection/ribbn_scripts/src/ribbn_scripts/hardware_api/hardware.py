@@ -8,6 +8,13 @@ import json
 WIFI_PORT = 3333
 WIFI_TIMEOUT = 10 #sec
 
+# A reply that started arriving and then went quiet this long is lost, not
+# slow: the firmware prints a whole blob in one go, and even the 10000-sample
+# dump streams out with no gap anywhere near this at 115200 baud. This is what
+# bounds the wait when the tail of a blob -- closing brace included -- never
+# turns up, instead of sitting out the caller's whole timeout.
+PARTIAL_REPLY_IDLE_S = 5 #sec
+
 BLADERF_PORT = 3334 #control port of bladerf_exciter_server.py
 BLADERF_TIMEOUT = 5 #sec
 
@@ -16,6 +23,34 @@ tag2_mac = b'94:3C:C6:6D:53:5C\r\n'
 tag3_mac = b'10:97:BD:D4:05:10\r\n'
 tag4_mac = b'94:3C:C6:6D:29:2C\r\n'
 pos_mac = [tag1_mac, tag2_mac, tag3_mac, tag4_mac]
+
+
+class TruncatedReply(Exception):
+    """
+        A reply that can no longer arrive: the line ended with no closing
+        brace, or the tag closed the session mid-blob. Separate from the read
+        loops' timeouts because there is nothing left to wait for -- the only
+        move is to re-shoot the whole round, which is what MPPMultiWaysEsync()
+        does with it.
+    """
+
+
+def _parse_json_blob(buffer):
+    """
+        The {...} blob in `buffer`, or None while it isn't all there yet.
+
+        Shared by every read loop below so "have I got a whole reply?" is
+        answered the same way in all of them, and so its counterpart
+        (_fastfail_if_lost) is the only other place that decides.
+    """
+    start = buffer.find('{')
+    end = buffer.rfind('}')
+    if start == -1 or end < start:
+        return None
+    try:
+        return json.loads(buffer[start:end + 1])
+    except Exception:
+        return None
 
 class Exciter:
     def __init__(self):
@@ -111,6 +146,8 @@ class Tag:
         self.ser = None
         self.sock = None
         self._wifi_buf = b''
+        self._wifi_eof = False      # peer closed: see _wifi_readline()
+        self._wifi_last_rx = 0.0    # when bytes last arrived, line or not
         self._wifi_host = None
         self._wifi_port = None
         self.resetTime=60 #sec
@@ -134,7 +171,7 @@ class Tag:
             try:
                 # print("Connect started for",self.com_str)
 
-                self.ser = serial.Serial(port=self.com_str, baudrate=115200, parity=serial.PARITY_NONE,
+                self.ser = serial.Serial(port=self.com_str, baudrate=921600, parity=serial.PARITY_NONE,
                                          stopbits=serial.STOPBITS_ONE, bytesize=serial.EIGHTBITS, timeout=0)
                 not_connected = 0
                 # print("Connect done for",self.com_str)
@@ -174,6 +211,7 @@ class Tag:
                 self.sock = socket.create_connection((host, port), timeout=timeout)
                 self.sock.settimeout(0.05)
                 self._wifi_buf = b''
+                self._wifi_eof = False
                 self._wifi_host = host      # remembered for reconnect_wifi()
                 self._wifi_port = port
                 return
@@ -225,14 +263,14 @@ class Tag:
 
     def reconnect_wifi(self, deadline_s=60, poll_s=0.5, host=None, port=None):
         """
-            Reopens the TCP channel the firmware dropped when it suspended
-            the radio for an esync window. No serial involved: retrying the
-            connect IS the readiness check, since the listener only comes
-            back once the radio is up.
+            Reopens the TCP channel after the firmware dropped it. No
+            serial involved: retrying the connect IS the readiness check,
+            since the listener only comes back once the radio is up.
 
-            That also makes this the signal that the window is over -- it
-            returns either because the tag synced and fired or because the
-            firmware hit ESYNC_WIFI_TIMEOUT_MS. Ask qr which it was.
+            This used to be the wait for an esync window, which took the
+            radio down on purpose. It does not any more (see loop() in the
+            firmware), so reaching here now means the link actually died --
+            a dropped association, or the session reaped from under us.
 
             connect_wifi() retries forever, so the deadline lives here.
         """
@@ -258,6 +296,7 @@ class Tag:
             sock.settimeout(0.05)
             self.sock = sock
             self._wifi_buf = b''
+            self._wifi_eof = False
             self._wifi_host = host
             self._wifi_port = port
             return
@@ -267,10 +306,14 @@ class Tag:
 
     def fetch_queued_wifi(self, timeout=WIFI_TIMEOUT, ack=None):
         """
-            Pulls the reply the firmware buffered while the radio was down.
-            Returns the command's own JSON, or {"info":"qr","pending":0} if
-            no queued command ran -- which is how a timed-out window (no
-            preamble lock) is told apart from a good one.
+            Pulls the reply the firmware buffered because the staging
+            session was gone when the command fired. Returns the command's
+            own JSON, or {"info":"qr","pending":0} if nothing was buffered.
+
+            The esync path does not come through here any more: the radio
+            stays up through the window, so the reply goes back over the live
+            socket and await_fired_wifi() takes it. Over a session that did
+            drop, this is still how the reply is recovered.
 
             `ack` is for staged commands that do NOT answer in JSON: rdb
             replies with the plain line "rdb", so qr hands that line back
@@ -299,6 +342,7 @@ class Tag:
         """
         buffer = ""
         read_start_time = time.time()
+        last_rx = read_start_time
         while True:
             if time.time() - read_start_time > timeout:
                 print(f"{what} timed out after {timeout}s waiting for {ack!r} "
@@ -308,21 +352,53 @@ class Tag:
 
             line = self._wifi_readline()
             if len(line) == 0:
+                # Checked only once the buffered lines are used up, so an ack
+                # already in hand still wins over a session closing behind it.
+                self._fastfail_if_lost(buffer, what, True, last_rx)
                 time.sleep(0.001)
                 continue
+            last_rx = time.time()
 
             buffer += line.decode(errors='ignore')
 
-            start = buffer.find('{')
-            end = buffer.rfind('}')
-            if start != -1 and end > start:
-                try:
-                    return json.loads(buffer[start:end + 1])
-                except Exception:
-                    pass
+            payload = _parse_json_blob(buffer)
+            if payload is not None:
+                return payload
 
             if ack in buffer:
                 return {"info": "qr", "pending": 1, "cmd": ack}
+
+            self._fastfail_if_lost(buffer, what, True, last_rx)
+
+    def await_fired_wifi(self, ack=None, timeout=WIFI_TIMEOUT):
+        """
+            Waits on the live socket for the reply of the command the
+            preamble fired, and returns it.
+
+            This is what replaces reconnect_wifi() + fetch_queued_wifi() now
+            that the esync window leaves the radio up: the staging session is
+            still open when runQueuedCommand() dispatches, so the reply goes
+            straight back over this socket and the deferred buffer stays
+            empty -- qr would answer "pending":0. The reply landing is the
+            only proof the tag heard the preamble, so this wait IS the wait
+            for the sync, and it has to be bounded by the caller: a window
+            that hears nothing never answers.
+
+            `ack` is for a staged command that does not reply in JSON: rdb
+            answers with the plain line "rdb" (queue_capture_wifi -> "rdb").
+            Left as None a JSON blob is expected, which is what a staged
+            adc_/mpp_/mac gives.
+
+            Note there is no discard_read here, unlike every command method:
+            nothing was just sent, and the line waited for may already be in
+            the buffer -- dropping one would drop the answer itself.
+        """
+        if ack is None:
+            return self._read_json(self._wifi_readline, timeout,
+                                   "await_fired_wifi")
+        self._read_until_contains(self._wifi_readline, ack, timeout,
+                                  "await_fired_wifi")
+        return {"info": "fired", "cmd": ack}
 
     def esync_report(self, timeout=WIFI_TIMEOUT):
         """
@@ -345,6 +421,12 @@ class Tag:
         return self._read_json(self._wifi_readline, timeout, "esync_report_wifi")
 
     def _wifi_write(self, data):
+        # A reply cut short by the tag closing the session leaves this socket
+        # dead, so the re-shoot's first command has to go out on a new one --
+        # otherwise every attempt after the failed one fails on the corpse of
+        # the old connection instead of actually retrying.
+        if self._wifi_eof and self._wifi_host is not None:
+            self.reconnect_wifi(deadline_s=WIFI_TIMEOUT)
         self.sock.sendall(data)
 
     def _wifi_readline(self):
@@ -352,20 +434,36 @@ class Tag:
             Raw-socket equivalent of self.ser.readline() with timeout=0:
             returns whatever line is available in the internal buffer, or
             b'' (without blocking) if a full line hasn't arrived yet.
+
+            An empty b'' from a recv that did not time out is not "nothing
+            yet" -- it is the tag having closed the session, which reads the
+            same as a quiet socket and used to be waited out for the whole
+            timeout. It is recorded in self._wifi_eof so the read loops can
+            fail immediately instead.
         """
         nl = self._wifi_buf.find(b'\n')
         if nl == -1:
             try:
                 chunk = self.sock.recv(65536)
+                if not chunk:
+                    self._wifi_eof = True
             except socket.timeout:
                 chunk = b''
             except OSError:
                 chunk = b''
+                self._wifi_eof = True
             if chunk:
                 self._wifi_buf += chunk
+                self._wifi_last_rx = time.time()
             nl = self._wifi_buf.find(b'\n')
 
         if nl == -1:
+            if self._wifi_eof and self._wifi_buf:
+                # Hand back the unterminated tail: the newline is never
+                # coming, and the caller's diagnostics want what did land.
+                line = self._wifi_buf
+                self._wifi_buf = b''
+                return line
             return b''
 
         line = self._wifi_buf[:nl + 1]
@@ -384,6 +482,11 @@ class Tag:
     def listen_esync_wifi(self, timeout=WIFI_TIMEOUT):
         """
             WiFi counterpart to listen_esync().
+
+            This socket stays usable across the window -- arming no longer
+            takes the tag's radio down -- so the fired reply comes back on it
+            (await_fired_wifi), and the sample loop carries the WiFi task's
+            jitter. esyncr's `stalls` is where that shows up.
         """
         discard_read=self._wifi_readline()
         self._wifi_write(bytes("esync"+"\r\n", "UTF8"))
@@ -397,9 +500,9 @@ class Tag:
             The counterpart to listen_esync(). Needed because arming is
             sticky in a way that outlives the host: a run killed between
             `esync` and the sync leaves the tag listening, and the firmware
-            only resumes its radio after ESYNC_WIFI_TIMEOUT_MS -- it does
-            not stop listening. The next run then finds a tag already
-            armed, reporting "listening":1 from somebody else's window.
+            never stops listening on its own. The next run then finds a tag
+            already armed, reporting "listening":1 from somebody else's
+            window.
         """
         discard_read=self.ser.readline()
         self.ser.write(bytes("esyncs\r\n", "UTF8"))
@@ -560,6 +663,13 @@ class Tag:
             The tag starts reading ADC out and stores it in microcontroller
             memory. 
         """
+        # Whatever is still in the OS buffer is the tail of a reply nobody
+        # is waiting for any more -- a dump this round abandoned
+        # (TruncatedReply) would otherwise be read back as the next answer.
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
         self.ser.write(b"rdb\0\n")
         command_start_time=time.time()
         prev=''
@@ -641,15 +751,19 @@ class Tag:
 
         buffer = ""
         read_start_time = time.time()
+        last_rx = read_start_time
         while True:
             if time.time() - read_start_time > self.resetTime:
                 print(f"stop_reading timed out after {self.resetTime}s; received {len(buffer)} chars so far: {buffer[:300]!r}")
                 raise Exception("Stuck in stop_reading")
 
+            self._fastfail_if_lost(buffer, "stop_reading", False, last_rx)
+
             line = self.ser.readline()
             if len(line) == 0:
                 time.sleep(0.001)
                 continue
+            last_rx = time.time()
 
             try:
                 buffer += line.decode(errors='ignore')
@@ -657,17 +771,9 @@ class Tag:
                 print(e)
                 continue
 
-            start = buffer.find('{')
-            end = buffer.rfind('}')
-            if start == -1 or end == -1 or end < start:
-                continue
-
-            try:
-                payload = json.loads(buffer[start:end + 1])
-            except Exception:
-                continue
-
-            return self.clean_buf_data(payload)
+            payload = _parse_json_blob(buffer)
+            if payload is not None:
+                return self.clean_buf_data(payload)
 
     def stop_reading_wifi(self, timeout=WIFI_TIMEOUT):
         """
@@ -679,14 +785,18 @@ class Tag:
 
         buffer = ""
         read_start_time = time.time()
+        last_rx = read_start_time
         while True:
             if time.time() - read_start_time > timeout:
                 print(f"stop_reading_wifi timed out after {timeout}s; received {len(buffer)} chars so far: {buffer[:300]!r}")
                 raise Exception("Stuck in stop_reading_wifi")
 
+            self._fastfail_if_lost(buffer, "stop_reading_wifi", True, last_rx)
+
             line = self._wifi_readline()
             if len(line) == 0:
                 continue
+            last_rx = time.time()
 
             try:
                 buffer += line.decode(errors='ignore')
@@ -694,17 +804,9 @@ class Tag:
                 print(e)
                 continue
 
-            start = buffer.find('{')
-            end = buffer.rfind('}')
-            if start == -1 or end == -1 or end < start:
-                continue
-
-            try:
-                payload = json.loads(buffer[start:end + 1])
-            except Exception:
-                continue
-
-            return self.clean_buf_data(payload)
+            payload = _parse_json_blob(buffer)
+            if payload is not None:
+                return self.clean_buf_data(payload)
 
     def _read_until_contains(self, readline, target, timeout, timeout_msg):
         """
@@ -713,6 +815,7 @@ class Tag:
             reads (e.g. b'{"info":"mp' + b'p","ch":8,...}') is still caught
             instead of missed by a single readline() check.
         """
+        wifi = readline == self._wifi_readline
         start_time = time.time()
         prev = ''
         while True:
@@ -723,6 +826,11 @@ class Tag:
             raw = readline()
             line = raw.decode(errors='ignore') if isinstance(raw, bytes) else raw
             if len(line) == 0:
+                if wifi and self._wifi_eof:
+                    raise TruncatedReply(
+                        f"{timeout_msg}: tag closed the session before "
+                        f"{target!r} arrived; last {len(prev)} chars: "
+                        f"{prev[:200]!r}")
                 time.sleep(0.001)
                 continue
 
@@ -735,6 +843,59 @@ class Tag:
             else:
                 prev = combined
 
+    def _fastfail_if_lost(self, buffer, what, wifi, last_rx):
+        """
+            Raise as soon as the rest of the reply cannot still be on its way.
+
+            Three ways a reply is lost rather than late:
+
+            * the tag closed the session (EOF, see _wifi_readline) -- nothing
+              more will ever arrive on this socket;
+            * the line ended with no closing brace. Each JSON reply is one
+              println in the firmware (dumpCapture() in acquisition.cpp), so a
+              buffer that ends in a newline and still holds no balanced blob is
+              missing bytes from the middle -- the brace is not coming;
+            * a blob that started and then went quiet for PARTIAL_REPLY_IDLE_S,
+              which is the same loss with the tail missing instead, so the
+              newline above never arrives to prove it.
+
+            All three used to be waited out for the caller's whole timeout --
+            60 s for a capture dump -- before raising. Failing here instead
+            lets the caller re-shoot the round while the setup is still hot
+            (MPPMultiWays()/MPPMultiWaysEsync() both do).
+        """
+        if wifi and self._wifi_eof:
+            raise TruncatedReply(
+                f"{what}: tag closed the session with the reply incomplete "
+                f"after {len(buffer)} chars: ...{buffer[-200:]!r}")
+
+        if wifi:
+            # _wifi_readline returns whole lines only, so a dump that stopped
+            # before its newline has not put a single byte in `buffer` -- it is
+            # all still held there. Judge the reply on both, and on when bytes
+            # last arrived rather than when a line last completed, or a dump
+            # that is simply long looks like one that stopped.
+            pending = buffer + self._wifi_buf.decode(errors='ignore')
+            last_rx = max(last_rx, self._wifi_last_rx)
+        else:
+            pending = buffer
+
+        if '{' not in pending:
+            return      # nothing has started yet: the timeout owns this wait
+
+        if pending.endswith('\n'):
+            raise TruncatedReply(
+                f"{what}: reply line ended with no closing brace after "
+                f"{len(pending)} chars: {pending[:120]!r} ... "
+                f"{pending[-200:]!r}")
+
+        idle = time.time() - last_rx
+        if idle > PARTIAL_REPLY_IDLE_S:
+            raise TruncatedReply(
+                f"{what}: reply stopped mid-blob -- nothing for {idle:.1f}s "
+                f"after {len(pending)} chars: {pending[:120]!r} ... "
+                f"{pending[-200:]!r}")
+
     def _read_json(self, readline, timeout, what):
         """
             Accumulates bytes from `readline` until a balanced {...} blob can
@@ -742,29 +903,28 @@ class Tag:
             (serial timeout=0, socket timeout=0.05), so any reply bigger than
             one read arrives split across several of them.
         """
+        wifi = readline == self._wifi_readline
         buffer = ""
         read_start_time = time.time()
+        last_rx = read_start_time
         while True:
             if time.time() - read_start_time > timeout:
                 print(f"{what} timed out after {timeout}s; received {len(buffer)} chars so far: {buffer[:300]!r}")
                 raise Exception("Stuck in " + what)
 
+            self._fastfail_if_lost(buffer, what, wifi, last_rx)
+
             line = readline()
             if len(line) == 0:
                 time.sleep(0.001)
                 continue
+            last_rx = time.time()
 
             buffer += line.decode(errors='ignore')
 
-            start = buffer.find('{')
-            end = buffer.rfind('}')
-            if start == -1 or end == -1 or end < start:
-                continue
-
-            try:
-                return json.loads(buffer[start:end + 1])
-            except Exception:
-                continue
+            payload = _parse_json_blob(buffer)
+            if payload is not None:
+                return payload
 
     def clean_adc_data(self, payload):
         """
