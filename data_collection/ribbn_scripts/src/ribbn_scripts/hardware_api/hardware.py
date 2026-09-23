@@ -171,7 +171,7 @@ class Tag:
             try:
                 # print("Connect started for",self.com_str)
 
-                self.ser = serial.Serial(port=self.com_str, baudrate=115200, parity=serial.PARITY_NONE,
+                self.ser = serial.Serial(port=self.com_str, baudrate=921600, parity=serial.PARITY_NONE,
                                          stopbits=serial.STOPBITS_ONE, bytesize=serial.EIGHTBITS, timeout=0)
                 not_connected = 0
                 # print("Connect done for",self.com_str)
@@ -263,14 +263,14 @@ class Tag:
 
     def reconnect_wifi(self, deadline_s=60, poll_s=0.5, host=None, port=None):
         """
-            Reopens the TCP channel the firmware dropped when it suspended
-            the radio for an esync window. No serial involved: retrying the
-            connect IS the readiness check, since the listener only comes
-            back once the radio is up.
+            Reopens the TCP channel after the firmware dropped it. No
+            serial involved: retrying the connect IS the readiness check,
+            since the listener only comes back once the radio is up.
 
-            That also makes this the signal that the window is over -- it
-            returns either because the tag synced and fired or because the
-            firmware hit ESYNC_WIFI_TIMEOUT_MS. Ask qr which it was.
+            This used to be the wait for an esync window, which took the
+            radio down on purpose. It does not any more (see loop() in the
+            firmware), so reaching here now means the link actually died --
+            a dropped association, or the session reaped from under us.
 
             connect_wifi() retries forever, so the deadline lives here.
         """
@@ -306,10 +306,14 @@ class Tag:
 
     def fetch_queued_wifi(self, timeout=WIFI_TIMEOUT, ack=None):
         """
-            Pulls the reply the firmware buffered while the radio was down.
-            Returns the command's own JSON, or {"info":"qr","pending":0} if
-            no queued command ran -- which is how a timed-out window (no
-            preamble lock) is told apart from a good one.
+            Pulls the reply the firmware buffered because the staging
+            session was gone when the command fired. Returns the command's
+            own JSON, or {"info":"qr","pending":0} if nothing was buffered.
+
+            The esync path does not come through here any more: the radio
+            stays up through the window, so the reply goes back over the live
+            socket and await_fired_wifi() takes it. Over a session that did
+            drop, this is still how the reply is recovered.
 
             `ack` is for staged commands that do NOT answer in JSON: rdb
             replies with the plain line "rdb", so qr hands that line back
@@ -365,6 +369,36 @@ class Tag:
                 return {"info": "qr", "pending": 1, "cmd": ack}
 
             self._fastfail_if_lost(buffer, what, True, last_rx)
+
+    def await_fired_wifi(self, ack=None, timeout=WIFI_TIMEOUT):
+        """
+            Waits on the live socket for the reply of the command the
+            preamble fired, and returns it.
+
+            This is what replaces reconnect_wifi() + fetch_queued_wifi() now
+            that the esync window leaves the radio up: the staging session is
+            still open when runQueuedCommand() dispatches, so the reply goes
+            straight back over this socket and the deferred buffer stays
+            empty -- qr would answer "pending":0. The reply landing is the
+            only proof the tag heard the preamble, so this wait IS the wait
+            for the sync, and it has to be bounded by the caller: a window
+            that hears nothing never answers.
+
+            `ack` is for a staged command that does not reply in JSON: rdb
+            answers with the plain line "rdb" (queue_capture_wifi -> "rdb").
+            Left as None a JSON blob is expected, which is what a staged
+            adc_/mpp_/mac gives.
+
+            Note there is no discard_read here, unlike every command method:
+            nothing was just sent, and the line waited for may already be in
+            the buffer -- dropping one would drop the answer itself.
+        """
+        if ack is None:
+            return self._read_json(self._wifi_readline, timeout,
+                                   "await_fired_wifi")
+        self._read_until_contains(self._wifi_readline, ack, timeout,
+                                  "await_fired_wifi")
+        return {"info": "fired", "cmd": ack}
 
     def esync_report(self, timeout=WIFI_TIMEOUT):
         """
@@ -448,6 +482,11 @@ class Tag:
     def listen_esync_wifi(self, timeout=WIFI_TIMEOUT):
         """
             WiFi counterpart to listen_esync().
+
+            This socket stays usable across the window -- arming no longer
+            takes the tag's radio down -- so the fired reply comes back on it
+            (await_fired_wifi), and the sample loop carries the WiFi task's
+            jitter. esyncr's `stalls` is where that shows up.
         """
         discard_read=self._wifi_readline()
         self._wifi_write(bytes("esync"+"\r\n", "UTF8"))
@@ -461,9 +500,9 @@ class Tag:
             The counterpart to listen_esync(). Needed because arming is
             sticky in a way that outlives the host: a run killed between
             `esync` and the sync leaves the tag listening, and the firmware
-            only resumes its radio after ESYNC_WIFI_TIMEOUT_MS -- it does
-            not stop listening. The next run then finds a tag already
-            armed, reporting "listening":1 from somebody else's window.
+            never stops listening on its own. The next run then finds a tag
+            already armed, reporting "listening":1 from somebody else's
+            window.
         """
         discard_read=self.ser.readline()
         self.ser.write(bytes("esyncs\r\n", "UTF8"))

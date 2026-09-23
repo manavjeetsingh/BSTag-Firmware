@@ -57,45 +57,24 @@ void loop(void)
         servicePlotter();
     }
 
-    /* The esync window runs with the radio off. The WiFi driver and lwIP
-     * tasks outrank loopTask, so their preemption lands directly on the
-     * sample loop and shows up as milliseconds of sync error between
-     * tags. Suspending for the window removes it.
+    /* The esync window used to run with the radio off (wifiSuspend() here,
+     * wifiResume() after the capture), because the WiFi driver and lwIP
+     * tasks outrank loopTask and their preemption lands straight on the
+     * sample loop as sync error between tags.
      *
-     * Suspend happens here, not in esyncListen(), so the "esync:listening"
-     * ack has already been flushed by pollSession() above. Resume waits
-     * for the capture to finish as well as the edge, since a queued rdb
-     * keeps sampling in loop() long after runQueuedCommand() returns. */
-    static uint32_t esync_quiet_since_ms = 0;
-    static bool     esync_quiet_done = false;   /* done for this arming */
-
+     * It is not worth what it cost: every round took the radio down and
+     * re-associated it, and with two tags doing that per round the link gave
+     * out after ~15 rounds -- both tags stopped answering their TCP server at
+     * the same moment, mid-run. The radio stays up through the window now, so
+     * the jitter is back: watch `stalls` and `rho` in esyncr, and the dwell
+     * `score` out of segmentation, since the queued capture is jittered too.
+     *
+     * With the session alive the fired command's reply goes straight back
+     * over it (see runQueuedCommand()), so nothing lands in the deferred
+     * buffer and there is no reconnect to wait on. wifiSuspend()/Resume()
+     * stay for the wifi_off/wifi_on commands. */
     if (esyncActive()) {
-        /* Gated on our own flag, not on wifiSuspended(): with WiFi built
-         * off (empty WIFI_SSID) wifiSuspend() is a no-op and never reports
-         * suspended, which would run the quiet delay on every pass and
-         * throttle the detector to 20 Hz. */
-        if (!esync_quiet_done) {
-            delay(ESYNC_WIFI_QUIET_MS);   /* let the ack get out first */
-            wifiSuspend();
-            esync_quiet_done = true;
-            esync_quiet_since_ms = millis();
-        } else if (wifiSuspended() &&
-                   millis() - esync_quiet_since_ms >= ESYNC_WIFI_TIMEOUT_MS) {
-            /* The exciter never fired. Holding the radio down any longer
-             * locks the host out over TCP with no way back except Serial,
-             * so bring it up and leave it up. Listening continues, but an
-             * edge caught from here on is sampled with WiFi running, so
-             * its sync is degraded -- this notice marks the run. */
-            wifiResume();
-            Serial.println("{\"info\":\"esync\",\"wifi\":\"resumed\","
-                           "\"reason\":\"timeout\",\"sync\":\"degraded\"}");
-        }
         esyncSample();
         esyncListening();
-    } else {
-        esync_quiet_done = false;         /* next esync arms cleanly */
-        if (wifiSuspended() && !captureActive()) {
-            wifiResume();
-        }
     }
 }

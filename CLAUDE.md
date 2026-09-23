@@ -45,7 +45,7 @@ Two size limits shape what the protocol can carry, and both fail loudly rather t
 
 **Multi-transport sessions** (`session.h`/`session.cpp`): one `Session` slot per transport (slot 0 is always Serial, slots 1..`MAX_TCP_CLIENTS` are TCP clients), each with its own line-assembly buffer. `handleCommand()` is transport-agnostic — it takes whatever `Print &out` its session gives it, plus `session_idx` so streaming commands (`spl`) know where to keep writing.
 
-**Exciter sync (esync)** is the mechanism that makes multiple physically separate tags act in lockstep with the exciter, without a shared clock. `esync` arms a one-shot preamble detector, and WiFi is suspended for the listening window (`net.cpp`'s `wifiSuspend()`/`wifiResume()`) because the WiFi/lwIP tasks outrank the sample loop and jitter it by milliseconds.
+**Exciter sync (esync)** is the mechanism that makes multiple physically separate tags act in lockstep with the exciter, without a shared clock. `esync` arms a one-shot preamble detector, and the radio stays up through the listening window. It used to be suspended for it (`net.cpp`'s `wifiSuspend()`/`wifiResume()`), because the WiFi/lwIP tasks outrank the sample loop and jitter it by milliseconds — but that cost a disconnect and a re-association per round per tag, and the link gave out mid-run after ~15 rounds with two tags. The jitter is the accepted cost now: `stalls` in `esyncr` is where it shows, and the queued capture carries it too. `wifiSuspend()`/`wifiResume()` remain for the `wifi_off`/`wifi_on` commands.
 
 The exciter (`BladeRFCode/ASK_sync/bladerf_cw.py`) keys the carrier on/off through a Barker-13 code, 2 ms per chip, 26 ms in all. The tag averages its samples into `ESYNC_BIN_US` time bins, so it works on a uniform grid however unevenly `loop()` runs. It then Pearson-correlates the last preamble's worth of bins against the mean-removed code. It locks on the correlation peak, interpolated between bins, which marks the preamble's end. The lock needs ρ ≥ `ESYNC_MIN_RHO`, on-minus-off ≥ `ESYNC_MIN_SWING_MV`, and the peak must stay the best for `ESYNC_CONFIRM_US`. The queued command then fires `ESYNC_FIRE_DELAY_US` later, into steady carrier. The score depends on shape, not level, so there is no per-tag mV floor to tune, and a steady offset or interferer cancels out. See `BladeRFCode/ASK_sync/README.md` for the plain-language version and the simulation results the defaults came from.
 
@@ -57,7 +57,7 @@ The fire lands a fixed few hundred µs after the true preamble end. That offset 
 
 `esyncr` after a fire reports `t_us` (the lock), `fire_us`, `rho`, `on_mv`/`off_mv`/`swing_mv`, `resid_mv` (per-bin noise the code does not explain) and `snr_db`. When nothing has fired, it reports `primed`, `armed` (locked, fire pending), `stalls` (loop gaps longer than a preamble, which restart the window) and `peak_rho`, the best score seen. A `peak_rho` near the threshold means the preamble was heard but too noisy. Near zero means it never arrived, or the code or chip length does not match.
 
-Because the radio is down when it fires, the reply is captured to RAM instead of a (possibly dead) socket and pulled later with `qr`; on the host side this is `hardware.py`'s `reconnect_wifi()` + `fetch_queued_wifi()` pattern. If nothing arrives within `ESYNC_WIFI_TIMEOUT_MS`, the firmware brings WiFi back up on its own (with a `"sync":"degraded"` notice) so a host isn't locked out over TCP with no path back except Serial.
+Because the session survives the window, `runQueuedCommand()` writes the fired reply straight back over it, and the host waits for that reply on the live socket — `hardware.py`'s `await_fired_wifi()`, bounded by `esync_mpp.FIRE_DEADLINE_S` because a window that hears no preamble never answers. The deferred RAM buffer and `qr` are still there for the case they were built for: a staging session that really is gone when the command fires (a dropped client, or a Serial-staged command after a reset).
 
 ## Firmware module layout (`XIAO-ESP32-C6_firmware_wifi/`)
 
@@ -70,10 +70,10 @@ The header comment at the top of the `.ino` is the map; module boundaries matter
 - `esync.*` — exciter sync listener and ASK preamble correlator
 - `commands.*` — the text/JSON protocol, transport-agnostic (takes `Print &`)
 - `session.*` — per-transport line assembly and dispatch, drives `commands.cpp`
-- `net.*` — WiFi link management and the TCP command server, including suspend/resume for esync
+- `net.*` — WiFi link management and the TCP command server, including suspend/resume (for `wifi_off`/`wifi_on`; esync no longer uses it)
 - `buffered_out.h` — TX-coalescing `Print` wrapper used when writing larger replies
 
-`loop()` in the `.ino` is the scheduler: service WiFi/TCP, poll every session for a complete line, then step whichever of capture/plotter/esync is currently active. The esync suspend/resume dance around `wifiSuspend()`/`wifiResume()` has real ordering constraints explained inline — read the comments there before touching it.
+`loop()` in the `.ino` is the scheduler: service WiFi/TCP, poll every session for a complete line, then step whichever of capture/plotter/esync is currently active. It used to suspend and resume WiFi around the esync window; the comment where that was records why it went and what it cost.
 
 ## Host tooling (`ribbn_scripts/`)
 

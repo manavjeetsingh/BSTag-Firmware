@@ -72,8 +72,9 @@ the preamble ends. Per MPP round (`MPPMultiWaysEsync`):
 2. Arm — `esync` on every tag, then `ARM_SETTLE_S` (1 s) so every radio is
    down and every correlator has a full preamble's worth of carrier.
 3. Sync — `exc.sync()` sends one preamble.
-4. Collect — reconnecting is the wait: the firmware keeps WiFi down until the
-   queued capture finishes. Then `qr`, `esyncr`, and `rds` (the trace).
+4. Collect — waiting for the fired reply is the wait, on the session that
+   stayed up: the plain line `rdb` from an Rx tag, the `mpp` blob from the Tx
+   tag, bounded by `FIRE_DEADLINE_S`. Then `esyncr`, and `rds` (the trace).
 5. Check — every tag's `esyncr` must show a lock (`rho`). Any failure drops
    the round and re-shoots it from step 1, up to `MAX_ROUND_ATTEMPTS` (10).
 

@@ -57,7 +57,7 @@ def tag_ops(tag_instance, transport):
             "reflect": tag_instance.reflect_wifi,
             "disconnect": tag_instance.disconnect_wifi,
             # esync: staged here, fired by the exciter's preamble, collected
-            # once the radio is back. Wired runs don't need it.
+            # over the same session. Wired runs don't need it.
             "stage_mpp": lambda: tag_instance.queue_mpp_wifi(1),
             "stage_capture": tag_instance.queue_capture_wifi,
             "arm_esync": tag_instance.listen_esync_wifi,
@@ -85,15 +85,27 @@ def _reset_esync(tag_instance):
 
 
 def _collect_esync(tag_instance, want_trace):
-    """Pick up what a tag did while its radio was down.
+    """Pick up what the preamble fired, over the session that stayed up.
 
-    Reconnecting is the wait: the firmware keeps WiFi down until the queued
-    capture is done. Rx tags staged rdb, whose qr ack is the plain line
-    "rdb"; the trace then comes over the live socket with rds, shaped exactly
+    Waiting for the fired reply is the wait for the sync: an Rx tag staged rdb
+    and answers the plain line "rdb", the Tx tag staged mpp_1 and answers its
+    JSON. The trace then comes over the same socket with rds, shaped exactly
     like a wired capture.
+
+    A window that hears no preamble never answers, so the wait is bounded. On
+    a timeout the tag is disarmed and its report fetched anyway -- that report
+    is what carries peak_rho into check_fired()'s message -- and the round is
+    failed by the "queued": None below.
     """
-    tag_instance.reconnect_wifi(deadline_s=esync_mpp.RECONNECT_DEADLINE_S)
-    queued = tag_instance.fetch_queued_wifi(ack="rdb" if want_trace else None)
+    ack = "rdb" if want_trace else None
+    try:
+        queued = tag_instance.await_fired_wifi(
+            ack=ack, timeout=esync_mpp.FIRE_DEADLINE_S)
+    except Exception:
+        _reset_esync(tag_instance)
+        return {"queued": None,
+                "report": tag_instance.esync_report_wifi(),
+                "trace": None}
     report = tag_instance.esync_report_wifi()
     trace = tag_instance.stop_reading_wifi() if want_trace else None
     return {"queued": queued, "report": report, "trace": trace}
@@ -356,8 +368,8 @@ def _drainResults(result_q):
 def _esyncRound(rx_tags, tx_tag, exc, result_q):
     """One shot: stage, arm, sync, collect.
 
-    Everything is staged before anything is armed, because `esync` takes the
-    radio down ESYNC_WIFI_QUIET_MS after acking and a later q_ never lands.
+    Everything is staged before anything is armed: an armed tag can lock on
+    the next preamble it hears, and a lock with an empty slot fires nothing.
     """
     all_tags = [tx_tag] + list(rx_tags)
 
@@ -370,8 +382,9 @@ def _esyncRound(rx_tags, tx_tag, exc, result_q):
         cmd_qs[tag].put("esync_arm")
     _gather(result_q, "esync_armed", all_tags, timeout=30)
 
-    # Radios down and correlators primed before the preamble -- and before the
-    # collects start, or they reconnect to the old socket before it closes.
+    # Correlators primed with carrier before the preamble, and the collects
+    # posted before it too, so every tag is already reading its socket when
+    # its fired reply lands there.
     time.sleep(esync_mpp.ARM_SETTLE_S)
 
     cmd_qs[tx_tag].put("esync_collect_tx")
@@ -381,13 +394,20 @@ def _esyncRound(rx_tags, tx_tag, exc, result_q):
     mpp_start_time, mpp_stop_time = exc.sync()
 
     results = _gather(result_q, "esync_result", all_tags,
-                      timeout=esync_mpp.RECONNECT_DEADLINE_S + 60)
+                      timeout=esync_mpp.FIRE_DEADLINE_S + 60)
     failed = [t for t, r in results.items() if r is None]
     if failed:
         raise Exception(f"esync collect failed on tag(s) {sorted(failed)}")
 
     reports = {f"Tag{tag_id}": r["report"] for tag_id, r in results.items()}
     esync_mpp.check_fired(reports)
+
+    # check_fired() goes first: a tag that never locked explains itself with
+    # peak_rho. Reaching here means it locked but its reply never arrived.
+    no_reply = [t for t, r in results.items() if r["queued"] is None]
+    if no_reply:
+        raise Exception(f"locked but no fired reply from tag(s) "
+                        f"{sorted(no_reply)}")
 
     voltage_readings = {tag_id: r["trace"]
                         for tag_id, r in results.items() if r["trace"] is not None}

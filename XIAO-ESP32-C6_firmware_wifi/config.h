@@ -89,12 +89,16 @@
                                          weakest tag this is meant for. */
 #define ESYNC_CONFIRM_US       1000   /* a peak must stay the best this long */
 #define ESYNC_FIRE_DELAY_US    5000   /* fire this long after the peak */
-#define ESYNC_WIFI_QUIET_MS    50     /* ack drain before the radio goes down */
-#define ESYNC_WIFI_TIMEOUT_MS  30000  /* no preamble by now: bring the radio back */
+/* ESYNC_WIFI_QUIET_MS / ESYNC_WIFI_TIMEOUT_MS are gone with the suspend: the
+ * radio stays up through the window, so there is no ack to drain before it
+ * drops and nothing to time out and bring back. See loop(). */
 
-/* Deferred reply. The queued command fires while the radio is down, so
- * its reply is captured here and handed over with qr after the host
- * reconnects. Sized for the worst case, MAX_ADC_SAMPLES in mV: each
+/* Deferred reply. Used when the staging session is gone by the time the
+ * queued command fires -- a Serial-staged command after a reset, or a TCP
+ * client that dropped -- so its reply is captured here and handed over with
+ * qr. The esync path no longer needs it (the radio stays up and the reply
+ * goes back over the live socket), but the slot still backs that case.
+ * Sized for the worst case, MAX_ADC_SAMPLES in mV: each
  * sample prints as up to "5000.000," = 9 B, plus the header. Raising
  * MAX_ADC_SAMPLES without raising this makes qr answer with an overflow
  * error instead of the trace. */
