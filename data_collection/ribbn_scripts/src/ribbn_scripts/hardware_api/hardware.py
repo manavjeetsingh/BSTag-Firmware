@@ -8,6 +8,15 @@ import json
 WIFI_PORT = 3333
 WIFI_TIMEOUT = 10 #sec
 
+# How long a single recv() on the command socket waits before giving up and
+# letting the read loop go round again. Only a polling granularity: a recv
+# returns the moment bytes land, so this never delays a reply -- it bounds how
+# long a loop sits in the kernel when the tag has nothing to say.
+#
+# It is NOT what a discard costs. _wifi_drain() below is non-blocking for
+# exactly that reason; see its docstring.
+WIFI_POLL_S = 0.05 #sec
+
 # A reply that started arriving and then went quiet this long is lost, not
 # slow: the firmware prints a whole blob in one go, and even the 10000-sample
 # dump streams out with no gap anywhere near this at 115200 baud. This is what
@@ -51,6 +60,29 @@ def _parse_json_blob(buffer):
         return json.loads(buffer[start:end + 1])
     except Exception:
         return None
+
+def _wifi_sockopts(sock):
+    """
+        The options every tag command socket wants, in one place so
+        connect_wifi() and reconnect_wifi() cannot drift apart.
+
+        TCP_NODELAY turns off Nagle. The firmware already sets it on its end
+        (tcp_server.setNoDelay(true) and again per accepted client, see
+        net.cpp) and BladeRFExciter sets it on its own link; only the tag
+        sockets were left out, which reads as an oversight rather than a
+        choice. Nagle holds a small write back until the previous one is
+        acked, and this link is nothing but small writes waiting on a reply,
+        so it is exactly the pattern Nagle penalises -- paired with the
+        tag's delayed acks it can cost tens of ms on a command that should
+        take one round trip.
+
+        Not a fix for anything currently broken: with one command in flight
+        at a time there is usually nothing unacked for Nagle to hold behind.
+        It removes a failure mode rather than a measured delay.
+    """
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.settimeout(WIFI_POLL_S)
+
 
 class Exciter:
     def __init__(self):
@@ -209,7 +241,7 @@ class Tag:
         while True:
             try:
                 self.sock = socket.create_connection((host, port), timeout=timeout)
-                self.sock.settimeout(0.05)
+                _wifi_sockopts(self.sock)
                 self._wifi_buf = b''
                 self._wifi_eof = False
                 self._wifi_host = host      # remembered for reconnect_wifi()
@@ -293,7 +325,7 @@ class Tag:
                 time.sleep(poll_s)
                 continue
 
-            sock.settimeout(0.05)
+            _wifi_sockopts(sock)
             self.sock = sock
             self._wifi_buf = b''
             self._wifi_eof = False
@@ -323,7 +355,7 @@ class Tag:
             reading ["pending"] either way. Left as None only JSON is
             accepted, which is what a staged adc_/mpp_/mac gives.
         """
-        discard_read = self._wifi_readline()
+        self._wifi_drain()
         self._wifi_write(bytes("qr\r\n", "UTF8"))
         if ack is None:
             return self._read_json(self._wifi_readline, timeout,
@@ -416,7 +448,7 @@ class Tag:
             best correlation seen -- near 0.8 means heard but too noisy,
             near 0 means never heard.
         """
-        discard_read = self._wifi_readline()
+        self._wifi_drain()
         self._wifi_write(bytes("esyncr\r\n", "UTF8"))
         return self._read_json(self._wifi_readline, timeout, "esync_report_wifi")
 
@@ -428,6 +460,50 @@ class Tag:
         if self._wifi_eof and self._wifi_host is not None:
             self.reconnect_wifi(deadline_s=WIFI_TIMEOUT)
         self.sock.sendall(data)
+
+    def _wifi_drain(self):
+        """
+            Drop whatever is still on the socket, without waiting for it.
+
+            This is the discard every command method opens with: leftovers
+            from a reply nobody is waiting for any more (an abandoned dump, a
+            notice) would otherwise be read back as this command's answer.
+            The serial side does the same thing with reset_input_buffer().
+
+            It used to be spelled `discard_read = self._wifi_readline()`,
+            carried over from the serial methods where the port is opened
+            timeout=0 and readline() returns instantly. Over TCP the buffer is
+            normally empty, so that call went all the way to recv() and sat
+            out the socket's whole WIFI_POLL_S -- 50 ms on every command,
+            spent to throw away nothing. Four of them are in the critical path
+            of every esync round (ch_, the stage, the arm, esyncr).
+
+            Non-blocking instead, so an empty socket costs nothing, and it
+            drops the whole backlog rather than the first line of it -- which
+            is what the callers wanted in the first place. EOF is still
+            recorded: a drain is often the first thing to notice the tag went
+            away, and _wifi_write() reconnects on it.
+        """
+        self._wifi_buf = b''
+        if self.sock is None:
+            return
+        self.sock.settimeout(0)          # non-blocking for the drain only
+        try:
+            while True:
+                try:
+                    chunk = self.sock.recv(65536)
+                except BlockingIOError:
+                    return               # nothing pending: the normal case
+                except socket.timeout:
+                    return
+                except OSError:
+                    self._wifi_eof = True
+                    return
+                if not chunk:
+                    self._wifi_eof = True
+                    return
+        finally:
+            self.sock.settimeout(WIFI_POLL_S)
 
     def _wifi_readline(self):
         """
@@ -488,7 +564,7 @@ class Tag:
             (await_fired_wifi), and the sample loop carries the WiFi task's
             jitter. esyncr's `stalls` is where that shows up.
         """
-        discard_read=self._wifi_readline()
+        self._wifi_drain()
         self._wifi_write(bytes("esync"+"\r\n", "UTF8"))
         c_str="esync:listening\r\n"
         self._read_until_contains(self._wifi_readline, c_str, timeout, 'no valid answer timeout')
@@ -513,7 +589,7 @@ class Tag:
         """
             WiFi counterpart to stop_esync().
         """
-        discard_read=self._wifi_readline()
+        self._wifi_drain()
         self._wifi_write(bytes("esyncs\r\n", "UTF8"))
         self._read_until_contains(self._wifi_readline, "esync:stopped",
                                   timeout, 'no valid answer timeout')
@@ -538,7 +614,7 @@ class Tag:
         """
             WiFi counterpart to clear_queued_command().
         """
-        discard_read=self._wifi_readline()
+        self._wifi_drain()
         self._wifi_write(bytes("qc\r\n", "UTF8"))
         self._read_until_contains(self._wifi_readline, "q:cleared", timeout,
                                   'no valid answer timeout')
@@ -557,7 +633,7 @@ class Tag:
         """
             WiFi counterpart to queue_any().
         """
-        discard_read=self._wifi_readline()
+        self._wifi_drain()
 
         q_command="q_"+command_str
         c_str=f"q:queued, {command_str}\n"
@@ -651,7 +727,7 @@ class Tag:
 
         while True:
             try:
-                discard_read = self._wifi_readline()
+                self._wifi_drain()
                 self._wifi_write(bytes("ch_"+str(ch)+"\r\n", "UTF8"))
                 self._read_until_contains(self._wifi_readline, c_str, timeout, 'no valid answer timeout')
                 return
@@ -863,12 +939,10 @@ class Tag:
             60 s for a capture dump -- before raising. Failing here instead
             lets the caller re-shoot the round while the setup is still hot
             (MPPMultiWays()/MPPMultiWaysEsync() both do).
-        """
-        if wifi and self._wifi_eof:
-            raise TruncatedReply(
-                f"{what}: tag closed the session with the reply incomplete "
-                f"after {len(buffer)} chars: ...{buffer[-200:]!r}")
 
+            None of the three applies while a whole reply is already in hand,
+            which is why that is the first thing tested below.
+        """
         if wifi:
             # _wifi_readline returns whole lines only, so a dump that stopped
             # before its newline has not put a single byte in `buffer` -- it is
@@ -879,6 +953,30 @@ class Tag:
             last_rx = max(last_rx, self._wifi_last_rx)
         else:
             pending = buffer
+
+        if _parse_json_blob(pending) is not None:
+            # The whole reply is here, only not all of it read yet, so none of
+            # the tests below can be true of it: the caller's next readline()
+            # takes it out of _wifi_buf and its own parse returns it.
+            #
+            # This is what "still holds no balanced blob" in the second case
+            # above was always meant to say. Testing only for a '{' is what
+            # made a complete reply look like a truncated one whenever it
+            # shared a recv() with the line before it -- and the "TagV93 ready"
+            # banner does exactly that on every fresh socket, so a tag that
+            # answered perfectly, banner and blob in one packet, failed on the
+            # *banner's* newline with its own closing brace sitting unread
+            # behind it.
+            #
+            # It also settles the precedence between a complete reply and a
+            # session closing right behind it, the way _read_queued_ack()
+            # already orders those: read what arrived, then notice the EOF.
+            return
+
+        if wifi and self._wifi_eof:
+            raise TruncatedReply(
+                f"{what}: tag closed the session with the reply incomplete "
+                f"after {len(buffer)} chars: ...{buffer[-200:]!r}")
 
         if '{' not in pending:
             return      # nothing has started yet: the timeout owns this wait
@@ -1039,7 +1137,7 @@ class Tag:
         """
         cmd = "adcraw" if raw else "adc"
 
-        discard_read = self._wifi_readline()
+        self._wifi_drain()
         self._wifi_write(f"{cmd}_{count}\0\n".encode())
         payload = self._read_json(self._wifi_readline, timeout, "get_adc_val_wifi")
 
@@ -1062,7 +1160,7 @@ class Tag:
         """
             WiFi counterpart to get_mac().
         """
-        discard_read = self._wifi_readline()
+        self._wifi_drain()
         self._wifi_write(b'mac\0\n')
         payload = self._read_json(self._wifi_readline, timeout, "get_mac_wifi")
 

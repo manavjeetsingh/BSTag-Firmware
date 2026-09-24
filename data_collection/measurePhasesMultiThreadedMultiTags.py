@@ -106,6 +106,12 @@ def _collect_esync(tag_instance, want_trace):
         return {"queued": None,
                 "report": tag_instance.esync_report_wifi(),
                 "trace": None}
+    if want_trace:
+        # The ack above means the capture STARTED, not that it finished, and
+        # rds dumps whatever has landed rather than waiting. Let it fill --
+        # and stay off the wire while it does, so the commands below are not
+        # serviced mid-capture. See esync_mpp.CAPTURE_FILL_S.
+        time.sleep(esync_mpp.CAPTURE_FILL_S)
     report = tag_instance.esync_report_wifi()
     trace = tag_instance.stop_reading_wifi() if want_trace else None
     return {"queued": queued, "report": report, "trace": trace}
@@ -187,7 +193,13 @@ READTIME=5
 # so parking the receivers on it first means that switch is a no-op and the
 # rectifier is already settled (tau ~ 2.5 ms) when sampling starts
 CAPTURE_CHANNEL=2
-RX_SETTLE_S=0.02
+# Time for the receivers to actually be parked on CAPTURE_CHANNEL before the
+# round is staged on top of them. The rectifier's tau is ~2.5 ms and rdb
+# forces the channel anyway, so this is the ch_ command's round trip more than
+# it is settling. It was 0.02 back when the worker was still sitting in
+# reflect_wifi's 50 ms discard when this sleep expired -- the discard is
+# non-blocking now (hardware._wifi_drain), so the ack really has landed.
+RX_SETTLE_S=0.005
 EXC_SETTLE_S=0.1
 
 # Default Settings
@@ -250,7 +262,7 @@ MAX_WIRED_ROUND_ATTEMPTS = 3
 # round fail -- a truncated reply, a tag still draining an abandoned capture, a
 # preamble that landed on traffic -- clears on its own given a moment, and
 # re-shooting immediately tends to hit the same state again.
-RETRY_BACKOFF_S = 5.0
+RETRY_BACKOFF_S = 2.0
 
 
 def MPPMultiWays(rx_tags:list, cmdq_tx, result_q, channels):

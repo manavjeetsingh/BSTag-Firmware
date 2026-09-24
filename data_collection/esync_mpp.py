@@ -9,8 +9,40 @@ measurePhasesMultiThreadedMultiTags.py; this holds its timing and checks.
 
 # After the last arm ack, before the preamble. The tag needs 26 ms of carrier
 # to fill the correlator; a preamble sent before that is simply never heard.
-# The rest is margin. (It used to have to cover the radio going down too.)
-ARM_SETTLE_S = 0.3
+# The rest is margin.
+#
+# This was 0.3 while arming took the tag's radio down -- most of the margin
+# was there to cover it coming back. It does not any more (see loop() in the
+# firmware), so what is left to cover is the arm ack's flight time and the
+# slowest tag's first fill, and the round pays this in full every single
+# shot. A missed fill is not silent: it costs the lock, and esyncr reports it
+# as peak_rho near 0 with the swing still there. Watch that if this is cut
+# further -- 26 ms is the floor and there is nothing under it.
+ARM_SETTLE_S = 0.06
+
+# Between a receiver's rdb ack and the rds that dumps its trace.
+#
+# rdb acks when the capture STARTS -- captureStart() prints "rdb" and the
+# buffer then fills from loop(), self-stopping at CAPTURE_BUF_LEN. rds does
+# not wait for that: captureStop() + dumpCapture() hands back whatever has
+# landed so far. So the host has to hold off, and this is that wait.
+#
+# CAPTURE_BUF_LEN (3000) at the ~66.7 kSa/s sample loop is 45 ms nominal. The
+# margin on top is for loop jitter -- the radio stays up through the window
+# now, so the WiFi task preempts the sample loop (esyncr's `stalls`) and a
+# fill can run long. Erring high is cheap and erring low is not: 40 ms of
+# extra margin costs 40 ms, a short trace costs a re-shoot and RETRY_BACKOFF_S.
+#
+# Nothing used to wait here on purpose. The discard at the top of
+# esync_report_wifi() blocked on the socket for ~50 ms and that covered the
+# 45 ms fill -- a 5 ms margin nobody chose, sitting on a socket timeout. It
+# broke the moment the discard stopped blocking (hardware._wifi_drain), and
+# the symptom was traces of 140-210 samples failing segmentation.
+#
+# Holding the wire quiet is the other half of it: esyncr used to land after
+# the fill by accident, and now does so deliberately, rather than being
+# serviced mid-capture and jittering the trace it is reporting on.
+CAPTURE_FILL_S = 0.1
 
 # Re-shoots per MPP round before the run gives up. A missed preamble (a burst
 # landing on it) is worth retrying; one that misses every time is the setup.

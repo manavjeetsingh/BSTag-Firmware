@@ -95,22 +95,32 @@
 /* Buffered capture (rdb/rds). Stored as raw codes: 2 bytes/sample.
  *
  * Sized against what the capture is for, an esync-fired MPP sweep: nine
- * dwells of MPP_DWELL_QUEUED_US at the ~66.7 kSa/s sample loop is 1800
- * samples (27 ms), of which mpp_segment.py measures the last six. It does
- * not start at sample 0 -- the rx tag begins capturing at its own fire,
- * which leads the tx tag's sweep by whatever the two detectors disagree
- * by. Over a 2-tag wireless run that put the sweep's start at samples
- * 807..1119 and its end at 1971..2283, so the whole thing was always over
- * inside the first quarter of a 10000-sample buffer. 3000 covers the worst
- * of that with ~700 samples to spare; re-measure with fit_sweep_grid()
- * before trimming further, and raise it if the tags' fire offsets diverge
- * (compare t_us across tags).
+ * dwells of MPP_DWELL_QUEUED_US, of which mpp_segment.py measures the last
+ * six. It does not start at sample 0 -- the rx tag begins capturing at its
+ * own fire, which leads the tx tag's sweep by whatever the two detectors
+ * disagree by.
  *
- * Not free to oversize. loop() will not let wifiResume() run while the
- * capture is still going (see the .ino), so every sample past the sweep is
- * dead time charged to every round of the run, and it is then printed as
- * mV over TCP and again into the run's CSV. */
-#define CAPTURE_BUF_LEN        3000
+ * Measured over 400 traces of a 4-tag wireless run (2026-09-24), fitted
+ * with fit_sweep_grid(): dwell 43..46 samples, sweep start 86..243,
+ * measured window ending by 507, whole sweep including the ch1 pad over by
+ * 639. 1000 clears the worst of that by ~360 samples. Re-measure the same
+ * way before trimming further, and raise it if the tags' fire offsets
+ * diverge (compare t_us across tags).
+ *
+ * The earlier 3000 was sized off numbers an order of magnitude larger
+ * (sweep start 807..1119, end 1971..2283). Whatever those were measured
+ * under, today's runs do not reproduce them -- so treat the figures above
+ * as the live ones and re-measure rather than splitting the difference.
+ *
+ * Not free to oversize, and the cost is now explicit rather than hidden:
+ * the host holds off rds for esync_mpp.CAPTURE_FILL_S to let this fill
+ * before dumping it (rds takes whatever has landed), so the buffer length
+ * sets a sleep charged to every round -- and is then printed as mV over TCP
+ * and again into the run's CSV. At the ~15 kSa/s the wireless sample loop
+ * actually manages (46 samples per 3 ms dwell), 1000 fills in ~65 ms, which
+ * CAPTURE_FILL_S covers; 3000 needed ~200 ms and never reliably filled,
+ * which is why traces came back anywhere between 1635 and 3000 samples. */
+#define CAPTURE_BUF_LEN        1000
 #define CAPTURE_CHANNEL        2      /* channel forced on rdb */
 
 /* Exciter sync (esync). The exciter keys the carrier on/off through
