@@ -7,7 +7,7 @@ from matplotlib import pyplot as plt
 
 pwr = -15
 
-tag = Tag("COM34")
+tag = Tag("COM38")
 save_folder="C:/git/BSTag-Firmware/data_collection/ribbn_scripts/src/ribbn_scripts/calibrations/VNA_data_Sept2026"
 
 vna = VNA(pwr)
