@@ -27,6 +27,34 @@ PARTIAL_REPLY_IDLE_S = 5 #sec
 BLADERF_PORT = 3334 #control port of bladerf_exciter_server.py
 BLADERF_TIMEOUT = 5 #sec
 
+# The slotted schedule's two slot kinds, spelled the way the sq_ command
+# spells them (see handleCommand() in commands.cpp).
+SCHED_MPP = "mpp"
+SCHED_LISTEN = "lis"
+
+# SCHED_MAX_SLOTS in the firmware's config.h. Only used to fail a program
+# that is too long here, with the reason, rather than partway through loading
+# it on "sq:full" -- so a copy that has gone stale costs a wrong message, not
+# a wrong reading.
+SCHED_MAX_SLOTS_EXPECTED = 20
+
+# ADC_REF_MV and the 16-bit full scale from the firmware's config.h, as
+# rawToMilliVolts() applies them. A scheduled round is read back in raw codes
+# ("squ_raw") rather than millivolts, so this conversion moves here: printing
+# ~46000 samples as floats is the tag formatting a float per sample, and it
+# doubles what goes over the wire for a number the host can work out exactly.
+# Keep these in step with config.h or every scheduled trace is scaled wrong --
+# by a clean constant factor, so it will look like a gain change rather than
+# like a bug.
+ADC_REF_MV = 5000.0
+ADC_FULL_SCALE = 65535.0
+
+# A scheduled round's sqr dump is the largest reply the protocol carries: 19
+# listen slots of ~2400 raw codes is ~100 KB, which the tag prints one sample
+# at a time. Well clear of what that costs at 921600 baud, and it is a ceiling
+# rather than a wait -- the read returns on the closing brace.
+SCHED_REPORT_TIMEOUT = 60 #sec
+
 tag1_mac = b'EC:62:60:4D:34:8C\r\n'
 tag2_mac = b'94:3C:C6:6D:53:5C\r\n'
 tag3_mac = b'10:97:BD:D4:05:10\r\n'
@@ -679,6 +707,293 @@ class Tag:
             WiFi counterpart to queue_capture().
         """
         self.queue_any_wifi("rdb", timeout)
+
+    # ---- slotted schedule: the "multiple" collection mode ---------------
+    #
+    # One trigger runs an ordered program of equal-length slots on every tag
+    # at once -- each tag sweeps in its own slot and listens through everyone
+    # else's -- instead of one transmitter per round. The firmware side is
+    # schedule.cpp; the run loop that drives these is
+    # data_collection/multiple_collection.py.
+    #
+    # Loading is sqc, then the settings, then one sq_mpp / sq_lis per slot in
+    # order. Triggering is sgo over the cable, or the exciter's ASK preamble
+    # once esync is armed (a loaded program takes the fire from the single
+    # q_<cmd> slot, see esyncListening()). Reading back is sqr.
+
+    def _sched_send(self, line, expect, timeout, *, wifi):
+        """
+            One sq command and its ack, over whichever transport.
+
+            Unlike the rest of this class the two transports share a body
+            here: a schedule is loaded a slot at a time, so a 20-tag program
+            is twenty-odd of these per round, and two copies of the sequence
+            would be two places for the acks to drift apart.
+        """
+        if wifi:
+            self._wifi_drain()
+            self._wifi_write(bytes(line + "\r\n", "UTF8"))
+            readline = self._wifi_readline
+        else:
+            # Same reasoning as begin_reading(): whatever is still buffered is
+            # the tail of a reply nobody is waiting for any more.
+            try:
+                self.ser.reset_input_buffer()
+            except Exception:
+                pass
+            self.ser.write(bytes(line + "\r\n", "UTF8"))
+            readline = self.ser.readline
+
+        self._read_until_contains(readline, expect, timeout,
+                                  f"no answer to {line!r}")
+
+    def _sched_load(self, program, slot_us, listen_samples, raw, timeout,
+                    *, wifi):
+        """
+            Clear, configure, and load `program` -- a list of SCHED_MPP /
+            SCHED_LISTEN, one per slot, in the order they run.
+
+            The clear is not just tidiness. sqc drops the last run's results
+            along with the program (schedClear()), and so does every sq_ that
+            follows it, so reloading before each round is what makes a stale
+            sqr impossible: a tag that missed this round's trigger then
+            answers "pending":0 instead of handing back the previous round's
+            traces under this round's frequency. Worth the twenty extra acks.
+        """
+        if not program:
+            raise ValueError("a schedule needs at least one slot")
+        if len(program) > SCHED_MAX_SLOTS_EXPECTED:
+            raise ValueError(
+                f"{len(program)} slots asked for, but the firmware's "
+                f"SCHED_MAX_SLOTS is {SCHED_MAX_SLOTS_EXPECTED} -- the tag "
+                f"would answer 'sq:full' partway through loading. Raise it in "
+                f"config.h and reflash, or run fewer tags.")
+
+        self._sched_send("sqc", "sq:cleared", timeout, wifi=wifi)
+        if slot_us is not None:
+            self._sched_send(f"sqd_{int(slot_us)}", "sq:slot_us", timeout,
+                             wifi=wifi)
+        if listen_samples is not None:
+            self._sched_send(f"sqn_{int(listen_samples)}", "sq:listen_samples",
+                             timeout, wifi=wifi)
+        self._sched_send("squ_raw" if raw else "squ_mv", "sq:unit", timeout,
+                         wifi=wifi)
+
+        for i, kind in enumerate(program):
+            if kind not in (SCHED_MPP, SCHED_LISTEN):
+                raise ValueError(f"slot {i} is {kind!r}, expected "
+                                 f"{SCHED_MPP!r} or {SCHED_LISTEN!r}")
+            # The ack counts the slots loaded so far, so matching on it is
+            # also the check that none of them went missing.
+            self._sched_send(f"sq_{kind}", f"sq:added, {kind}, {i + 1}",
+                             timeout, wifi=wifi)
+
+    def sched_clear(self, timeout=5):
+        """
+            Drop the loaded program and the last run's results (sqc).
+
+            Worth having on its own because a loaded program takes the esync
+            fire away from the single q_<cmd> slot: a tag left holding one
+            from an abandoned "multiple" run will run that program on the
+            next preamble instead of whatever an "individual" run staged.
+        """
+        self._sched_send("sqc", "sq:cleared", timeout, wifi=False)
+
+    def sched_clear_wifi(self, timeout=WIFI_TIMEOUT):
+        """
+            WiFi counterpart to sched_clear().
+        """
+        self._sched_send("sqc", "sq:cleared", timeout, wifi=True)
+
+    def sched_load(self, program, slot_us=None, listen_samples=None, raw=True,
+                   timeout=5):
+        self._sched_load(program, slot_us, listen_samples, raw, timeout,
+                         wifi=False)
+
+    def sched_load_wifi(self, program, slot_us=None, listen_samples=None,
+                        raw=True, timeout=WIFI_TIMEOUT):
+        """
+            WiFi counterpart to sched_load().
+        """
+        self._sched_load(program, slot_us, listen_samples, raw, timeout,
+                         wifi=True)
+
+    def _sched_go(self, barrier, timeout, *, wifi):
+        """
+            Trigger the loaded program and block until it has run.
+
+            `barrier` is how a wired run gets its tags to start together.
+            Every tag is on its own port in its own process, so N separate
+            writes of "sgo" would skew by however far apart those processes
+            happen to be scheduled -- and the slot grid only holds the tags in
+            step if they agree on where it starts. Everything that can be done
+            first is done before the wait, so what follows the release is the
+            write and nothing else.
+
+            A wireless run does not come through here at all: the exciter's
+            preamble triggers every tag off the same edge in the air, which no
+            amount of host scheduling can match.
+
+            sgo answers "sq:done" only once the last slot's boundary has
+            passed, so this returns with the traces already in the pool. The
+            other two answers it can give are refusals, and they are raised
+            rather than waited out -- nothing is coming after either one.
+        """
+        if wifi:
+            self._wifi_drain()
+            readline = self._wifi_readline
+        else:
+            try:
+                self.ser.reset_input_buffer()
+            except Exception:
+                pass
+            readline = self.ser.readline
+
+        if barrier is not None:
+            barrier.wait()
+
+        if wifi:
+            self._wifi_write(b"sgo\r\n")
+        else:
+            self.ser.write(b"sgo\r\n")
+        trigger_time = time.time()
+
+        buffer = ""
+        read_start_time = time.time()
+        while True:
+            if time.time() - read_start_time > timeout:
+                print(f"sgo timed out after {timeout}s; received "
+                      f"{len(buffer)} chars so far: {buffer[:300]!r}")
+                raise Exception("Stuck in sched_go")
+
+            line = readline()
+            if len(line) == 0:
+                time.sleep(0.001)
+                continue
+            buffer += line.decode(errors='ignore')
+
+            if "sq:done" in buffer:
+                return trigger_time
+            # schedRun() never started, so nothing is on its way and there is
+            # nothing to wait for. Both of these are the host's mistake.
+            if "sq:empty" in buffer:
+                raise Exception("sgo refused: no program loaded on this tag")
+            if "sq:busy" in buffer:
+                raise Exception("sgo refused: the RF path is busy (a capture "
+                                "or plotter stream is still running)")
+
+    def sched_go(self, barrier=None, timeout=None):
+        if timeout is None:
+            timeout = self.resetTime
+        return self._sched_go(barrier, timeout, wifi=False)
+
+    def sched_go_wifi(self, barrier=None, timeout=None):
+        """
+            WiFi counterpart to sched_go(). A wireless run triggers off the
+            exciter's preamble instead, so this is for bring-up: it works, it
+            just carries the host's scheduling skew into the slot grid.
+        """
+        if timeout is None:
+            timeout = self.resetTime
+        return self._sched_go(barrier, timeout, wifi=True)
+
+    def sched_report(self, timeout=SCHED_REPORT_TIMEOUT):
+        """
+            Every slot's result from the last run (sqr), parsed.
+        """
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+        self.ser.write(b"sqr\r\n")
+        return self.clean_sched_data(
+            self._read_json(self.ser.readline, timeout, "sched_report"))
+
+    def sched_report_wifi(self, timeout=SCHED_REPORT_TIMEOUT):
+        """
+            WiFi counterpart to sched_report().
+        """
+        self._wifi_drain()
+        self._wifi_write(b"sqr\r\n")
+        return self.clean_sched_data(
+            self._read_json(self._wifi_readline, timeout, "sched_report_wifi"))
+
+    def clean_sched_data(self, payload):
+        """
+            Parse an sqr blob into {"slot_us", "unit", "heap", "slots": [...]}.
+
+            Each slot carries its metadata through unchanged plus, for a
+            listen slot, "trace" in millivolts and "rate_hz" -- the rate that
+            slot actually sampled at, from the count and the duration the
+            firmware timed. That rate is what tells the segmenter how long a
+            dwell is in samples; see sched_collect.dwell_samples_from_slot().
+        """
+        if not payload.get("pending"):
+            raise Exception(
+                "sqr has nothing to report: a program is loaded but has not "
+                "run. Over the air that means the tag never heard the "
+                "preamble -- check peak_rho in esyncr.")
+
+        raw_unit = payload.get("unit") == "raw"
+        scale = ADC_REF_MV / ADC_FULL_SCALE if raw_unit else 1.0
+
+        slots = []
+        for entry in payload.get("results", []):
+            slot = {
+                "i": entry.get("i"),
+                "kind": entry.get("kind"),
+                "ch": entry.get("ch"),
+                "t_us": entry.get("t_us"),
+                "count": entry.get("count"),
+                "dur_us": entry.get("dur_us"),
+                "truncated": bool(entry.get("full")),
+                "trace": None,
+                "rate_hz": None,
+            }
+            if slot["kind"] == "listen":
+                slot["trace"] = self._parse_sched_trace(entry) * scale
+                dur_us = slot["dur_us"]
+                if dur_us:
+                    slot["rate_hz"] = 1e6 * len(slot["trace"]) / dur_us
+            slots.append(slot)
+
+        return {
+            "slot_us": payload.get("slot_us"),
+            "unit": payload.get("unit"),
+            "heap": payload.get("heap"),
+            "slots": slots,
+        }
+
+    def _parse_sched_trace(self, entry):
+        """
+            One listen slot's "data" field as an array.
+
+            The fast path converts the whole field in one go, which matters
+            here in a way it does not for a single rdb dump: a 20-tag round is
+            nineteen of these per tag per round. It falls back to the tolerant
+            per-sample parse the other clean_*_data() methods use, so a field
+            with one mangled sample in it still yields the rest.
+        """
+        data = entry.get("data", "")
+        if not data:
+            return np.array([])
+        try:
+            values = np.array(data.split(','), dtype=float)
+        except ValueError:
+            values = []
+            for d in data.split(','):
+                try:
+                    values.append(float(d))
+                except Exception as e:
+                    print(e)
+            values = np.array(values)
+
+        count = entry.get("count")
+        if count is not None and len(values) > count:
+            raise TruncatedReply(
+                f"slot {entry.get('i')} reported {count} samples but "
+                f"{len(values)} arrived")
+        return values
 
     def read_queued(self, timeout=None):
         """

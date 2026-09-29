@@ -123,6 +123,53 @@ def parse_float_array(text: str) -> np.ndarray:
 
 
 CONNECTION_COL = "Connection"
+DWELL_COL = "Dwell (samples)"
+COLLECTION_COL = "Collection Type"
+
+# What a "multiple" round's listen slot samples at, when the CSV predates
+# DWELL_COL. Mirrors MPP_DWELL_QUEUED_US / SCHED_SAMPLE_US in the firmware's
+# config.h -- the paced rate is fixed, so the nominal is exact and only a
+# change to either constant makes this stale. Runs record the measured value
+# now, so this is only ever the fallback.
+SCHED_NOMINAL_DWELL = 3000 / 25
+
+
+def resolve_dwell(csv_path: str):
+    """Dwell length in samples for this CSV, or None to use the transport table.
+
+    A scheduled ("multiple") round does not sample at either of
+    mpp_segment.DWELL_SAMPLES' rates: its listen slots are a paced loop that
+    owns the CPU, not one sample per loop() pass behind the WiFi and session
+    servicing those two were measured under. Segmenting one by CONNECTION
+    alone looks for a 90-sample dwell in a trace whose dwell is 120, and every
+    window lands short -- which is what it looks like, a sweep drawn too
+    narrow, rather than an error.
+
+    So the recorded dwell wins wherever there is one, and an "individual" run
+    keeps using the transport table exactly as before.
+    """
+    try:
+        col = pd.read_csv(csv_path, usecols=[DWELL_COL])[DWELL_COL].dropna()
+        if not col.empty:
+            return float(col.median())
+    except ValueError:
+        pass        # CSV predates the column
+
+    try:
+        kinds = pd.read_csv(csv_path, usecols=[COLLECTION_COL])[COLLECTION_COL]
+        kinds = sorted({str(v).lower() for v in kinds.dropna().unique()})
+    except ValueError:
+        return None                      # older CSV: individual by definition
+    if kinds == ["multiple"]:
+        print(f"note: {csv_path} predates the {DWELL_COL!r} column; segmenting "
+              f"its scheduled traces with the nominal "
+              f"{SCHED_NOMINAL_DWELL:g} samples/dwell", file=sys.stderr)
+        return SCHED_NOMINAL_DWELL
+    if "multiple" in kinds:
+        raise SystemExit(
+            f"{csv_path} mixes collection types {kinds}; split it before "
+            f"plotting, the two need different dwell lengths")
+    return None
 
 
 def resolve_transport(csv_path: str, override: str = None) -> str:
@@ -163,7 +210,7 @@ def resolve_transport(csv_path: str, override: str = None) -> str:
 
 
 def segment_trace(voltages: np.ndarray, elapsed: float, channels: list,
-                  *, transport: str):
+                  *, transport: str, dwell_samples=None):
     """Locate the channel dwells, using the same fit as the live pipeline.
 
     Returns a time axis for the complete trace, the boundary positions and
@@ -173,9 +220,17 @@ def segment_trace(voltages: np.ndarray, elapsed: float, channels: list,
     `transport` is the CONNECTION the run was captured over; getting it wrong
     centres the dwell search on the other mode's length and the windows come
     out misplaced. resolve_transport() reads it off the CSV.
+
+    `dwell_samples` says the length outright and takes precedence, which is
+    how a scheduled round is segmented -- its rate belongs to neither
+    transport. resolve_dwell() reads it off the CSV.
     """
-    medians, per_channel, (start, dwell, _) = segment_capture(voltages, channels,
-                                                              transport=transport)
+    if dwell_samples is not None:
+        medians, per_channel, (start, dwell, _) = segment_capture(
+            voltages, channels, dwell_samples=dwell_samples)
+    else:
+        medians, per_channel, (start, dwell, _) = segment_capture(
+            voltages, channels, transport=transport)
 
     dt = elapsed / len(voltages)
     time = np.arange(len(voltages)) * dt
@@ -189,7 +244,7 @@ def segment_trace(voltages: np.ndarray, elapsed: float, channels: list,
 
 
 def plot_voltage_traces(csv_path: str, n_runs: int, output_path: str, freq: float = None,
-                        *, transport: str) -> None:
+                        *, transport: str, dwell_samples=None) -> None:
     df = pd.read_csv(csv_path)
     channels = sorted(
         int(c.split("_")[1]) for c in df.columns if c.startswith("Channel_") and c.endswith("_median")
@@ -223,8 +278,15 @@ def plot_voltage_traces(csv_path: str, n_runs: int, output_path: str, freq: floa
                     plt.close(fig)
                     return
                 elapsed = row["MPP Stop Time (s)"] - row["MPP Start Time (s)"]
-                time, ver_lines, segments = segment_trace(voltages, elapsed, channels,
-                                                          transport=transport)
+                rate = row.get("Sample Rate (Hz)")
+                if rate and rate > 0:
+                    # The row's own rate beats the start/stop pair: those are
+                    # wall-clock bookkeeping, and on a scheduled round they
+                    # bracket the slot rather than the trace.
+                    elapsed = len(voltages) / float(rate)
+                time, ver_lines, segments = segment_trace(
+                    voltages, elapsed, channels, transport=transport,
+                    dwell_samples=dwell_samples)
 
                 ax.plot(time, voltages, ".", markersize=2, color=CATEGORICAL_COLORS[0], label="ADC samples")
                 # everything outside the fitted sweep window is unused
@@ -406,7 +468,8 @@ def main():
 
     pdf_suffix = f"_voltage_traces_{args.freq:g}MHz.pdf" if args.freq is not None else "_voltage_traces.pdf"
     plot_voltage_traces(args.csv_path, args.runs, base + pdf_suffix, freq=args.freq,
-                        transport=resolve_transport(args.csv_path, args.transport))
+                        transport=resolve_transport(args.csv_path, args.transport),
+                        dwell_samples=resolve_dwell(args.csv_path))
 
 
 if __name__ == "__main__":

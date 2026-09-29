@@ -87,7 +87,19 @@ def check_fired(reports):
     """
     missed = [f"{name} never locked: peak_rho={r.get('peak_rho')} "
               f"peak_swing_mv={r.get('peak_swing_mv')} "
-              f"level_mv={r.get('level_mv')} stalls={r.get('stalls')}"
+              f"level_mv={r.get('level_mv')} stalls={r.get('stalls')} "
+              # These three separate the three ways this fails, and the
+              # firmware has always reported them -- they were just not
+              # carried into the message. listening=0 means the tag was not
+              # armed when the preamble went out (a host sequencing bug, not
+              # an RF one). primed=0, or samples far below the ~15 kSa/s the
+              # loop manages, means it was armed but never got a preamble's
+              # worth of bins to correlate. listening=1, primed=1, plenty of
+              # samples and peak_rho near the 1/sqrt(260)~0.09 noise floor
+              # means it listened and heard a flat carrier -- the preamble
+              # was not on the air, or not keyed.
+              f"listening={r.get('listening')} primed={r.get('primed')} "
+              f"samples={r.get('samples')}"
               for name, r in reports.items() if "rho" not in r]
     if missed:
         raise Exception("; ".join(missed))

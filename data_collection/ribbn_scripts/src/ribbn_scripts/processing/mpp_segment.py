@@ -27,6 +27,18 @@ import numpy as np
 # the dwell fit_sweep_grid() actually settled on.
 DWELL_SAMPLES = {"wireless": 45, "wired": 90}
 DWELL_TOLERANCE = 0.03   # absorbs small drift in that loop rate
+
+# The same margin, for a dwell the caller measured rather than looked up
+# (dwell_samples=). One sample, not 3% -- a scheduled listen slot is paced and
+# its rate comes back measured in the same report as the trace, so the nominal
+# is good to ~0.1% and the search does not need room to go looking.
+#
+# The width is not free. The fit picks the best-scoring (start, dwell) over the
+# whole range, and on a low-contrast trace that is as often noise as signal: at
+# 3% around 120 it returned dwells of 114 to 123 across 225 real traces whose
+# true dwell was 120, and a dwell wrong by 4 samples has walked two thirds of a
+# dwell off the grid by the sixth channel.
+MEASURED_DWELL_SLACK = 1
 N_PAD = 4                # leading ch1 dwells in MPP_CHANNELS
 EDGE_TRIM = 8            # samples either side of a switch, which catch the transition
 
@@ -37,7 +49,7 @@ def _block_means(cumsum, starts, lo_off, hi_off):
     return (cumsum[b] - cumsum[a]) / (b - a)
 
 
-def fit_sweep_grid(voltages, n_measured=6, *, transport):
+def fit_sweep_grid(voltages, n_measured=6, *, transport=None, dwell_samples=None):
     """Find (start, dwell) of the measured dwells; start is the ch1 window.
 
     `transport` picks which DWELL_SAMPLES the search is centred on; it only
@@ -51,6 +63,17 @@ def fit_sweep_grid(voltages, n_measured=6, *, transport):
     whichever 45-sample window happened to score best somewhere inside a
     200-sample dwell. A default is how that happens silently.
 
+    `dwell_samples` replaces that lookup with a nominal the caller already
+    knows, and is how the "multiple" collection mode segments its traces.
+    There is no DWELL_SAMPLES entry for those and there should not be: a
+    scheduled listen slot is a tight readAdcRaw() loop that owns the CPU,
+    not one sample per loop() pass behind the WiFi and session servicing
+    these two numbers were measured under, so its rate is several times
+    higher -- and the firmware reports it per slot ("dur_us" in sqr) rather
+    than leaving a third hand-measured constant to go stale. See
+    sched_collect.dwell_samples_from_slot(). Exactly one of the two must be
+    given.
+
     Scores a candidate grid by the contrast across the channel switches it
     implies, minus any step at the ch1 entry -- the padding dwell before the
     measured ch1 is the same channel, so that one boundary must be flat. That
@@ -61,14 +84,35 @@ def fit_sweep_grid(voltages, n_measured=6, *, transport):
     v = np.asarray(voltages, dtype=float)
     cs = np.concatenate([[0.0], np.cumsum(v)])
 
-    try:
-        nominal = DWELL_SAMPLES[transport]
-    except KeyError:
-        raise ValueError(f"unknown transport {transport!r}, expected one of "
-                         f"{sorted(DWELL_SAMPLES)}") from None
+    if (transport is None) == (dwell_samples is None):
+        raise ValueError("give exactly one of transport= or dwell_samples=; "
+                         f"got transport={transport!r}, "
+                         f"dwell_samples={dwell_samples!r}")
 
-    lo = int(nominal * (1 - DWELL_TOLERANCE))
-    hi = int(nominal * (1 + DWELL_TOLERANCE)) + 1
+    if dwell_samples is not None:
+        nominal = int(round(dwell_samples))
+        slack = MEASURED_DWELL_SLACK
+        if nominal < 2 * EDGE_TRIM + 1:
+            raise ValueError(
+                f"dwell_samples={dwell_samples} is too short to measure: "
+                f"EDGE_TRIM drops {EDGE_TRIM} samples either side of every "
+                f"switch, so a dwell needs more than {2 * EDGE_TRIM} samples "
+                f"to leave anything in the middle. Sample faster or dwell "
+                f"longer.")
+    else:
+        try:
+            nominal = DWELL_SAMPLES[transport]
+        except KeyError:
+            raise ValueError(f"unknown transport {transport!r}, expected one of "
+                             f"{sorted(DWELL_SAMPLES)}") from None
+        slack = None
+
+    if slack is None:
+        lo = int(nominal * (1 - DWELL_TOLERANCE))
+        hi = int(nominal * (1 + DWELL_TOLERANCE)) + 1
+    else:
+        lo = max(2 * EDGE_TRIM + 1, nominal - slack)
+        hi = nominal + slack + 1
 
     best = (-np.inf, None, None)
     for dwell in range(lo, hi):
@@ -92,16 +136,18 @@ def channel_windows(start, dwell, channels):
     return {ch: (start + i * dwell, start + (i + 1) * dwell) for i, ch in enumerate(channels)}
 
 
-def segment_capture(voltages, channels, *, transport):
+def segment_capture(voltages, channels, *, transport=None, dwell_samples=None):
     """Return (medians, per-channel samples, (start, dwell, score)).
 
     `transport` is the run's CONNECTION -- the dwell is a different length in
     samples on each, see DWELL_SAMPLES -- and is keyword-only with no default
-    for the reason fit_sweep_grid() gives.
+    for the reason fit_sweep_grid() gives. `dwell_samples` is the other way to
+    say where to look, for callers that measured it; pass exactly one.
     """
     v = np.asarray(voltages, dtype=float)
     start, dwell, score = fit_sweep_grid(v, n_measured=len(channels),
-                                         transport=transport)
+                                         transport=transport,
+                                         dwell_samples=dwell_samples)
 
     medians, per_channel = {}, {}
     for ch, (lo, hi) in channel_windows(start, dwell, channels).items():

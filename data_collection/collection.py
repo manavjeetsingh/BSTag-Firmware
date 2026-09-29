@@ -2,6 +2,7 @@ from init import (get_exising_mapping, get_ports, IGNORE_LIST, get_mac_address,
                   MAC_TAG_FILE, IP_MAC_FILE)
 from ribbn_scripts.hardware_api.hardware import Tag, WIFI_PORT
 import measurePhasesMultiThreadedMultiTags as mtt
+import multiple_collection
 import exciters
 import numpy as np
 import time
@@ -169,6 +170,17 @@ def main():
     # and which half of the Tag API the workers drive.
     connection = configurations.get("CONNECTION", mtt.WIRED).lower()
     print(f"Connection: {connection}")
+
+    # COLLECTION_TYPE picks the shape of a round, independently of the
+    # transport: "individual" is one transmitter per round (mtt.mainMultiWays),
+    # "multiple" is every direction off one trigger
+    # (multiple_collection.mainMultiple). Both work over either CONNECTION.
+    collection_type = configurations.get("COLLECTION_TYPE", mtt.INDIVIDUAL).lower()
+    if collection_type not in (mtt.INDIVIDUAL, mtt.MULTIPLE):
+        raise Exception(
+            f"COLLECTION_TYPE in configurations.json is {collection_type!r}, "
+            f"expected {mtt.INDIVIDUAL!r} or {mtt.MULTIPLE!r}")
+    print(f"Collection type: {collection_type}")
     if connection == mtt.WIRELESS and exciter_type != "bladerf":
         raise Exception(
             f"a wireless run is synced by the bladeRF's ASK preamble, but "
@@ -176,7 +188,12 @@ def main():
             f"EXC_POWER to a gain, ~60), or CONNECTION to \"wired\".")
 
     tag_endpoint_mapping, tag_mac_mapping, mac_tag_mapping=detect_tags(connection)
-    mtt.initialize(tag_endpoint_mapping, transport=connection)
+    # A wired "multiple" round is the only thing that needs the workers to act
+    # together on a host-issued command, so it is the only thing that gets a
+    # barrier; see initialize().
+    mtt.initialize(tag_endpoint_mapping, transport=connection,
+                   sync_barrier=(collection_type == mtt.MULTIPLE
+                                 and connection == mtt.WIRED))
     mtt.test(tag_endpoint_mapping.keys(), exciter_type=exciter_type,
              exc_power=configurations["EXC_POWER"],
              exciter_settings=exciter_settings)
@@ -189,7 +206,7 @@ def main():
     
     hw_config=load_hw_config()
     
-    err=mtt.mainMultiWays(
+    common=dict(
         num_exp_runs=configurations["NUM_EXP_RUNS"],
         hw_config=hw_config,
         save_path=configurations['SAVE_DIR'],
@@ -206,6 +223,17 @@ def main():
         tag_mac_mapping=tag_mac_mapping,
         transport=connection,
         exciter_settings=exciter_settings)
+
+    if collection_type == mtt.MULTIPLE:
+        # SCHED_SLOT_US and SCHED_LISTEN_SAMPLES are optional: left out, the
+        # slot length is the firmware's default and the trace length is worked
+        # out from the tag count and the pool (sched_collect.listen_samples_for).
+        err=multiple_collection.mainMultiple(
+            slot_us=configurations.get("SCHED_SLOT_US"),
+            listen_samples=configurations.get("SCHED_LISTEN_SAMPLES"),
+            **common)
+    else:
+        err=mtt.mainMultiWays(**common)
 
 
 

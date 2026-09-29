@@ -23,10 +23,24 @@ COMMAND_RESULT_TYPE = {
     "esync_collect_rx": "esync_result",
     "esync_collect_tx": "esync_result",
     "esync_reset": "esync_reset",
+    "esync_report": "esync_report",
+    "sched_load": "sched_loaded",
+    "sched_go": "sched_trigger",
+    "sched_report": "sched_result",
 }
 
 WIRED = "wired"
 WIRELESS = "wireless"
+
+# COLLECTION_TYPE in configurations.json: what a round is.
+#
+# "individual" is the original shape -- one transmitter per round, everyone
+# else capturing, repeated once per tag. "multiple" loads every tag with a
+# slotted program first and measures every direction off a single trigger;
+# see sched_collect.py and multiple_collection.py. The two share the tags,
+# the worker processes and the output format, and nothing else.
+INDIVIDUAL = "individual"
+MULTIPLE = "multiple"
 
 
 def connect_tag(endpoint, transport):
@@ -64,6 +78,18 @@ def tag_ops(tag_instance, transport):
             "collect_esync": lambda want_trace: _collect_esync(
                 tag_instance, want_trace),
             "reset_esync": lambda: _reset_esync(tag_instance),
+            # Slotted schedule ("multiple" collection mode). There is no
+            # sched_go here: a wireless round is triggered by the exciter's
+            # preamble, which is the whole reason the mode is arranged this
+            # way, and the tags are already armed for it through arm_esync.
+            "sched_load": tag_instance.sched_load_wifi,
+            "sched_report": tag_instance.sched_report_wifi,
+            # esyncr on its own. The esync_collect_* commands above fetch the
+            # report too, but only after waiting for a fired reply -- and a
+            # scheduled round never sends one, because schedRun() is called
+            # from the fire with no session to answer on. So a "multiple"
+            # round waits out its own slot grid and then asks for this.
+            "esync_report": tag_instance.esync_report_wifi,
         }
     return {
         "get_mac": tag_instance.get_mac,
@@ -73,6 +99,12 @@ def tag_ops(tag_instance, transport):
         "get_adc_val": tag_instance.get_adc_val,
         "reflect": tag_instance.reflect,
         "disconnect": tag_instance.disconnect,
+        # Slotted schedule ("multiple" collection mode). The wired trigger is
+        # sgo down each cable, released together by the barrier the worker
+        # holds -- see _sched_go() in hardware.py for why that matters.
+        "sched_load": tag_instance.sched_load,
+        "sched_go": tag_instance.sched_go,
+        "sched_report": tag_instance.sched_report,
     }
 
 
@@ -117,13 +149,17 @@ def _collect_esync(tag_instance, want_trace):
     return {"queued": queued, "report": report, "trace": trace}
 
 
-def device_worker(endpoint, tag_id, command_queue, result_queue, transport=WIRED):
+def device_worker(endpoint, tag_id, command_queue, result_queue, transport=WIRED,
+                  barrier=None):
     """
     A worker function to be run in a separate PROCESS. It instantiates its
     own Tag object to avoid sharing non-serializable objects.
 
     `endpoint` is a COM/tty port under WIRED and an IP address under
     WIRELESS; a wireless run has no serial cable attached at all.
+
+    `barrier` is the wired "multiple" mode's trigger rendezvous, shared by
+    every worker in the run (see initialize()). Only sched_go uses it.
     """
     print(f"Process for Tag {tag_id} on {endpoint} ({transport}) started.")
     # Each process creates its own instance of the Tag class -- and, over
@@ -134,6 +170,14 @@ def device_worker(endpoint, tag_id, command_queue, result_queue, transport=WIRED
 
     while True:
         command = command_queue.get()
+
+        # Most commands are a bare string. The scheduled ones carry arguments,
+        # so they arrive as (name, payload) -- unpacked here so everything
+        # below, including the error path's COMMAND_RESULT_TYPE lookup, still
+        # sees just the name.
+        payload = None
+        if isinstance(command, tuple):
+            command, payload = command
 
         if command == "STOP":
             ops["disconnect"]()
@@ -174,6 +218,26 @@ def device_worker(endpoint, tag_id, command_queue, result_queue, transport=WIRED
                 result_queue.put((tag_id, "esync_result", ops["collect_esync"](True)))
             elif command == "esync_collect_tx":
                 result_queue.put((tag_id, "esync_result", ops["collect_esync"](False)))
+            elif command == "esync_report":
+                # Wireless only; a wired round has no preamble to report on.
+                report = ops.get("esync_report")
+                result_queue.put((tag_id, "esync_report",
+                                  report() if report is not None else {}))
+            elif command == "sched_load":
+                ops["sched_load"](**payload)
+                result_queue.put((tag_id, "sched_loaded", True))
+            elif command == "sched_go":
+                # Wired only. Every worker is inside sched_go at this point,
+                # blocked on the barrier; the write goes out the instant it
+                # releases, and sgo does not answer until the last slot
+                # boundary has passed. What comes back is when this tag was
+                # triggered, which is the closest thing the round has to a
+                # start time.
+                result_queue.put((tag_id, "sched_trigger",
+                                  ops["sched_go"](barrier=barrier, **(payload or {}))))
+            elif command == "sched_report":
+                result_queue.put((tag_id, "sched_result",
+                                  ops["sched_report"](**(payload or {}))))
             elif command[:2]=='ch':
                 ops["reflect"](int(command[3:]))
 
@@ -231,21 +295,45 @@ cmd_qs = {}
 result_q = None 
 processes = {}
 
-def initialize(tag_endpoint_mapping, transport=WIRED):
+# The wired "multiple" trigger rendezvous, or None. Built by initialize() and
+# handed to every worker; multiple_collection.py resets it between rounds.
+sync_barrier_obj = None
+
+# How long a worker waits at that barrier before giving up on the others.
+# Long enough that a slow tag still makes it, short enough that a round whose
+# worker has died fails instead of hanging the run -- a broken barrier raises
+# in every worker still waiting, which fails the round and re-shoots it.
+BARRIER_TIMEOUT_S = 30
+
+def initialize(tag_endpoint_mapping, transport=WIRED, sync_barrier=False):
     """Spawn one worker process per tag.
 
     `tag_endpoint_mapping` is {"TagN": endpoint}: serial ports under WIRED,
     IP addresses under WIRELESS.
+
+    `sync_barrier` builds the rendezvous a wired "multiple" round triggers
+    off. Every worker waits on it and then writes sgo, so the tags start the
+    slot grid together instead of however far apart the OS happened to
+    schedule N processes. A wireless run does not want one -- the preamble in
+    the air is the rendezvous -- and an individual run has nothing to
+    synchronise: its receivers are already capturing when the sweep starts.
+
+    The barrier carries its own timeout, so a worker that died before reaching
+    it breaks the wait for everyone else rather than hanging the run.
     """
-    global cmd_qs, result_q, processes
+    global cmd_qs, result_q, processes, sync_barrier_obj
     n_tags = len(tag_endpoint_mapping)
     result_q = multiprocessing.Queue()
+
+    sync_barrier_obj = (multiprocessing.Barrier(n_tags,
+                                                timeout=BARRIER_TIMEOUT_S)
+                        if sync_barrier else None)
     
     # Create queues from the multiprocessing module
     for tag in tag_endpoint_mapping.keys():
         local_queue = multiprocessing.Queue()
         cmd_qs[tag]= local_queue
-        processes[tag] = multiprocessing.Process(target=device_worker, args=(tag_endpoint_mapping[tag], int(tag[3:]), local_queue, result_q, transport), daemon=True)
+        processes[tag] = multiprocessing.Process(target=device_worker, args=(tag_endpoint_mapping[tag], int(tag[3:]), local_queue, result_q, transport, sync_barrier_obj), daemon=True)
     
 
     # Start the child processes

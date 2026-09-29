@@ -12,6 +12,7 @@ struct SchedSlot {
     uint32_t count;      /* samples actually taken */
     uint8_t  ch;         /* channel the slot ran on */
     uint32_t start_us;   /* slot start, relative to the trigger */
+    uint32_t dur_us;     /* time `count` samples took, LISTEN only */
     bool     truncated;  /* the pool ran out before the slot did */
 };
 
@@ -54,6 +55,7 @@ bool schedAddSlot(uint8_t kind)
     s.count = 0;
     s.ch = 0;
     s.start_us = 0;
+    s.dur_us = 0;
     s.truncated = false;
     return true;
 }
@@ -152,14 +154,23 @@ void schedRun(void)
         slots[i].count = 0;
         slots[i].truncated = false;
         slots[i].off = 0;
+        slots[i].dur_us = 0;
     }
 
     /* Slot 0's transmitter has no previous slot to settle in, so everyone
      * waits out one preroll before the grid starts. Waiting on every tag
      * and not just the transmitter is deliberate: the grid has to be
-     * common, and a tag that skipped it would start slot 0 early. */
+     * common, and a tag that skipped it would start slot 0 early.
+     *
+     * Everyone else hops onto CAPTURE_CHANNEL here rather than at the top of
+     * slot 0, so their own rectifier settles during the preroll instead of
+     * during the trace. Leaving it to the slot meant slot 0's listeners
+     * started sampling mid-transient whenever they came into the round on
+     * some other channel. */
     if (isMppSlot(0)) {
         switchChannel(SCHED_CHANNELS[0]);
+    } else {
+        switchChannel(CAPTURE_CHANNEL);
     }
     uint32_t preroll_start = micros();
     while ((int32_t)(micros() - preroll_start - (uint32_t)SCHED_PREROLL_US) < 0) {
@@ -176,6 +187,11 @@ void schedRun(void)
         if (s.kind == SCHED_KIND_MPP) {
             runSchedSweep();
         } else {
+            /* Already here: the previous slot's padding put us on
+             * CAPTURE_CHANNEL and let the rectifier settle (see the pad
+             * below, and the preroll above). This is the no-op that proves
+             * it -- if it ever switches for real, the trace opens with a
+             * settling transient and segmentation pays for it. */
             switchChannel(CAPTURE_CHANNEL);
             s.off = next_off;
             uint32_t room = (next_off < SCHED_POOL_SAMPLES)
@@ -188,21 +204,67 @@ void schedRun(void)
             /* Stop on whichever comes first, the sample budget or the slot
              * boundary -- the budget normally, since it is sized to cover
              * the peer's sweep and not the whole slot. */
+            uint32_t sample_start = micros();
             while (s.count < want &&
                    (int32_t)((micros() - t0) - slot_end) < 0) {
+                /* Paced, not free-running: see SCHED_SAMPLE_US. The due time
+                 * is counted from sample_start rather than added up as we go,
+                 * so a sample that lands late costs only itself and does not
+                 * push the rest of the slot along with it. */
+                if (s.count > 0) {
+                    uint32_t due = sample_start + s.count * SCHED_SAMPLE_US;
+                    while ((int32_t)(micros() - due) < 0) {
+                    }
+                }
                 pool[s.off + s.count++] = readAdcRaw();
             }
+            /* How long those samples actually took. The host divides it into
+             * `count` to get the slot's sample rate, and from that the dwell
+             * length in samples that mpp_segment has to look for.
+             *
+             * It has to be measured rather than assumed because this loop is
+             * nothing like the one that fills a rdb capture: that one takes a
+             * single sample per loop() pass, behind serviceWifi(), serviceTcp()
+             * and every session poll, and mpp_segment's DWELL_SAMPLES (45
+             * wireless, 90 wired) are measurements of *that*. Here the slot
+             * owns the CPU and does nothing but readAdcRaw(), so the rate is
+             * several times higher and is not the same number on the two
+             * transports either. Reporting it means no third constant to
+             * measure by hand and leave to go stale -- and it is measured
+             * even though SCHED_SAMPLE_US now sets the rate, because that
+             * constant is a floor the loop can fall below, not a promise. */
+            s.dur_us = micros() - sample_start;
             next_off += s.count;
         }
 
         s.ch = current_channel;
 
-        /* Pad to the boundary. If the NEXT slot is ours to transmit in,
-         * spend the pad sitting on the sweep's first channel so the
-         * rectifier is settled when it starts -- that is what lets
-         * MPP_CHANNELS_SCHED drop the leading settle dwells. */
+        /* Spend the pad settling on whatever the NEXT slot needs, so no slot
+         * ever opens on a channel the rectifier has not caught up with.
+         *
+         * Transmitting next: sit on the sweep's first channel, which is what
+         * lets MPP_CHANNELS_SCHED drop the leading settle dwells.
+         *
+         * Listening next, having just transmitted: the hop to CAPTURE_CHANNEL
+         * cannot happen yet. Every other tag is still sampling our sweep's
+         * tail, and our switch would land in their traces as a step that is
+         * not a channel of the sweep. So it waits until their windows have
+         * closed -- listen_samples at SCHED_SAMPLE_US, the same budget they
+         * were given -- and takes whatever is left of the pad to settle in.
+         * Whichever of the two bounds is later wins, so a slot too short to
+         * satisfy both keeps its neighbours' traces clean and gives up
+         * settling time instead. */
         if (isMppSlot(i + 1)) {
             switchChannel(SCHED_CHANNELS[0]);
+        } else if (s.kind == SCHED_KIND_MPP) {
+            uint32_t rx_done = slot_start + listen_samples * SCHED_SAMPLE_US;
+            uint32_t settle  = slot_end - SCHED_RX_SETTLE_US;
+            uint32_t at = ((int32_t)(rx_done - settle) > 0) ? rx_done : settle;
+            if ((int32_t)(at - slot_end) > 0) {
+                at = slot_end;
+            }
+            padUntil(t0, at);
+            switchChannel(CAPTURE_CHANNEL);
         }
         padUntil(t0, slot_end);
     }
@@ -251,9 +313,10 @@ void schedReport(Print &out)
         }
 
         out.printf("{\"i\":%u,\"kind\":\"listen\",\"ch\":%u,\"t_us\":%lu,"
-                   "\"count\":%lu,\"full\":%u,\"data\":\"",
+                   "\"count\":%lu,\"dur_us\":%lu,\"full\":%u,\"data\":\"",
                    (unsigned)i, (unsigned)s.ch, (unsigned long)s.start_us,
-                   (unsigned long)s.count, s.truncated ? 1 : 0);
+                   (unsigned long)s.count, (unsigned long)s.dur_us,
+                   s.truncated ? 1 : 0);
         for (uint32_t k = 0; k < s.count; k++) {
             if (raw_unit) {
                 out.print(pool[s.off + k]);

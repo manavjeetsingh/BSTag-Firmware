@@ -209,18 +209,52 @@
  * is padded to SCHED_SLOT_US, which is what keeps the tags in step: the
  * boundaries are absolute offsets from the trigger, not a running total of
  * however long each command happened to take. */
-#define SCHED_MAX_SLOTS        25     /* one per tag; ~16 B of metadata each */
+#define SCHED_MAX_SLOTS        20     /* one per tag; ~20 B of metadata each */
 #define SCHED_SLOT_US          50000  /* per slot; must exceed the MPP sweep */
-#define SCHED_LISTEN_SAMPLES   2400   /* per listen slot, unless sqn_<n> lowers it */
+
+/* Sample period inside a listen slot.
+ *
+ * The slot owns the CPU -- nothing between one readAdcRaw() and the next --
+ * so left alone it samples at whatever that call costs, somewhere around
+ * 100-200 kSa/s. That is both more resolution than the 3 ms dwells need and
+ * more than the pool can pay for: one 24 ms sweep would be 2400-4800 samples,
+ * and nineteen of those do not fit in SCHED_POOL_SAMPLES at any setting. The
+ * slot would then hold only part of the sweep, which segments as garbage
+ * rather than failing.
+ *
+ * So the loop is paced instead. 25 us is ~120 samples per dwell -- well clear
+ * of mpp_segment's EDGE_TRIM at either end of one -- and puts a whole
+ * 8-dwell sweep in ~960 samples, which is what makes SCHED_LISTEN_SAMPLES
+ * affordable nineteen times over.
+ *
+ * It is a floor, not a guarantee: if readAdcRaw() ever cost more than this
+ * the loop would just free-run slower. Nothing here checks that, because the
+ * host can and does -- "dur_us" in sqr is measured, not assumed, and
+ * sched_collect.check_rate() compares it against this. */
+#define SCHED_SAMPLE_US        25
+
+/* Per listen slot, unless sqn_<n> changes it. 1200 * SCHED_SAMPLE_US = 30 ms
+ * against the 24 ms sweep it has to contain, so ~6 ms of margin for the tags'
+ * triggers disagreeing -- comfortably more than a barrier-released sgo or a
+ * shared preamble edge actually costs. */
+#define SCHED_LISTEN_SAMPLES   1200
 
 /* Raw codes for every listen slot of a round, 2 B each. This is the one big
- * allocation in the firmware, so it is a budget rather than
- * SCHED_MAX_SLOTS * SCHED_LISTEN_SAMPLES: 25 tags at full length would be
- * 115 KB, and the free DRAM after globals is the FreeRTOS heap that WiFi and
- * lwIP allocate from (~90-110 KB of it in use once associated). 96 KB here
- * leaves ~65 KB spare. The host divides it with sqn_<n>, so small runs get
- * long traces and only a 25-tag run is squeezed; schedReport() prints the
- * free heap so the margin is visible rather than a crash. */
+ * allocation in the firmware, and it is a budget rather than
+ * SCHED_MAX_SLOTS * SCHED_LISTEN_SAMPLES because the two need not meet: the
+ * free DRAM after globals is the FreeRTOS heap that WiFi and lwIP allocate
+ * from (~90-110 KB of it in use once associated), so 96 KB here leaves
+ * ~65 KB spare and there is no room to round the budget up "just in case".
+ *
+ * At today's numbers no run is squeezed: a 20-tag round listens in 19 slots,
+ * and 19 * SCHED_LISTEN_SAMPLES = 22800 sits well inside 48000. The headroom
+ * is what a run with fewer tags spends on longer traces -- the host divides
+ * this budget by the slot count (sched_collect.listen_samples_for()) rather
+ * than assuming the default always fits, so raising SCHED_LISTEN_SAMPLES or
+ * SCHED_MAX_SLOTS does not quietly start overrunning. A slot that does run
+ * out is flagged "full":1 in its sqr entry rather than silently truncated,
+ * and schedReport() prints the free heap so the margin stays visible rather
+ * than turning into a crash. */
 #define SCHED_POOL_SAMPLES     48000
 
 /* Channel order for the scheduled sweep. Shorter than runMppSweep()'s table:
@@ -250,10 +284,28 @@
  * one-sided -- which is a timing dependency this does not need. */
 #define MPP_CHANNELS_SCHED     { 1, 1, 1, 3, 4, 6, 7, 8 }
 
-/* Time on ch1 before slot 0's sweep, for the one tag that transmits first
- * and so has no previous slot to settle in. ~3 tau of the rectifier. Paid
- * once per round, by every tag, so the slot grid stays common. */
-#define SCHED_PREROLL_US       9000
+/* How long the rectifier needs after the tag changes its OWN channel, before
+ * the level it reads means anything. ~5 tau.
+ *
+ * This matters because a tag reads its own rectified carrier, and its own
+ * switch state moves that reading by far more than the backscatter it is
+ * trying to measure. Measured on a 4-tag wired round (2026-09-24): the one
+ * listen slot that followed the tag's own transmit slot -- ch8 at the end of
+ * the sweep, then straight to CAPTURE_CHANNEL with no pause -- drifted +2.7
+ * to +9.9 mV across its first 8 ms, against channel contrasts of 2.4 to 17 mV
+ * in the same traces. Every other listen slot drifted under 1.7 mV, because
+ * the tag was already sitting on CAPTURE_CHANNEL.
+ *
+ * So every channel change into a listen slot is now paid for out of the
+ * previous slot's padding instead of out of the trace. See schedRun(). */
+#define SCHED_RX_SETTLE_US     12000
+
+/* Time on the entry channel before slot 0, for the one tag that transmits
+ * first and so has no previous slot to settle in -- and, since every tag
+ * waits it out to keep the grid common, the settle for everyone else's hop
+ * onto CAPTURE_CHANNEL too. Must therefore be at least SCHED_RX_SETTLE_US;
+ * it was 9000 when only the transmitter's ch1 settle was in view. */
+#define SCHED_PREROLL_US       12000
 
 #if NET_ENABLED
 #define SESSION_COUNT          (1 + MAX_TCP_CLIENTS)   /* slot 0 is Serial */
