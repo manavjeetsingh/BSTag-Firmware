@@ -11,7 +11,7 @@ exc.set_pwr(-30)
 save_folder='PV_data_Sept2026_705_995_-7'
 
 
-tag = Tag("COM31")
+tag = Tag("COM35")
 fn=tag.get_mac().replace(":",'_')
 tag.reflect(2)
 
