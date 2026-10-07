@@ -1,8 +1,8 @@
 {
-    "CONNECTION": "wireless",
+    "CONNECTION": "wired",
     "COLLECTION_TYPE": "multiple",
     "EXCITER": "bladerf",
-    "EXC_POWER": 35,
+    "EXC_POWER": 20,
     "MPP_REPETITIONS": 1,
     "FREQ_MIN": 775,
     "FREQ_MAX": 995,
