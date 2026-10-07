@@ -1,3 +1,13 @@
+import os
+
+# One BLAS/OpenMP thread per process. Must be set before numpy is first
+# imported (init -> hardware -> pandas does that). The per-tag workers
+# re-import this file and inherit the environment, and none of them does
+# heavy linear algebra -- but each would otherwise reserve a thread pool (and
+# its memory) per CPU core, times one process per tag.
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 from init import (get_exising_mapping, get_ports, IGNORE_LIST, get_mac_address,
                   MAC_TAG_FILE, IP_MAC_FILE)
 from ribbn_scripts.hardware_api.hardware import Tag, WIFI_PORT
@@ -7,7 +17,6 @@ import exciters
 import numpy as np
 import time
 import pickle
-import os
 import ast
 import pandas as pd
 
@@ -84,7 +93,7 @@ def tag_detection():
         else:
             tag_port_mapping[mac_tag_mapping[mac]] = p
             
-    print(f"Detected tag(s): {tag_port_mapping}")
+    print(f"Detected tag(s), ({len(tag_port_mapping)}): {tag_port_mapping}")
     return tag_port_mapping, tag_mac_mapping, mac_tag_mapping
 
 
@@ -139,7 +148,7 @@ def tag_detection_wireless():
 
         tag_ip_mapping[mac_tag_mapping[mac]] = ip
 
-    print(f"Detected tag(s): {tag_ip_mapping}")
+    print(f"Detected tag(s), ({len(tag_ip_mapping)}): {tag_ip_mapping}")
     return tag_ip_mapping, tag_mac_mapping, mac_tag_mapping
 
 

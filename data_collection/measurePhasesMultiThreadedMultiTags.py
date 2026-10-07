@@ -305,6 +305,14 @@ sync_barrier_obj = None
 # in every worker still waiting, which fails the round and re-shoots it.
 BARRIER_TIMEOUT_S = 30
 
+# Pause between starting one worker and the next. On Windows every worker is
+# a fresh interpreter that re-imports collection.py and with it pandas, numpy,
+# scipy and matplotlib; a dozen doing that at the same instant (next to the
+# parent holding GNU Radio and the bladeRF) runs out of committed memory and
+# they die mid-import (WinError 1455 / DLL load failed). Staggering them
+# keeps only a couple importing at once. Costs n_tags * this at startup.
+WORKER_START_STAGGER_S = 0.75
+
 def initialize(tag_endpoint_mapping, transport=WIRED, sync_barrier=False):
     """Spawn one worker process per tag.
 
@@ -336,8 +344,10 @@ def initialize(tag_endpoint_mapping, transport=WIRED, sync_barrier=False):
         processes[tag] = multiprocessing.Process(target=device_worker, args=(tag_endpoint_mapping[tag], int(tag[3:]), local_queue, result_q, transport, sync_barrier_obj), daemon=True)
     
 
-    # Start the child processes
-    for p in processes.values():
+    # Start the child processes, staggered -- see WORKER_START_STAGGER_S
+    for i, p in enumerate(processes.values()):
+        if i:
+            time.sleep(WORKER_START_STAGGER_S)
         p.start()
     
 
