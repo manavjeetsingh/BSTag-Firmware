@@ -103,11 +103,18 @@ def _trigger_wired(order, slot_us):
     return min(starts), max(starts) + duration, skew_ms
 
 
-def _trigger_wireless(order, slot_us, exc):
-    """Arm every tag and let the exciter's preamble start the grid.
+def _trigger_wireless(order, slot_us, exc, exc_power):
+    """Light the carrier, arm every tag and let the exciter's preamble start
+    the grid. The caller mutes the carrier again (see _round()).
 
     Returns (start, stop, reports, waited_s).
     """
+    # Before the arm, not after: the off->on step then passes while nobody is
+    # correlating, and the arm exchange plus ARM_SETTLE_S still puts far more
+    # than the 26 ms of carrier the correlator needs ahead of the preamble.
+    # The unmute and the preamble go through the same sink buffer, so its
+    # latency delays both alike.
+    exc.set_pwr(exc_power)
     for tag in order:
         mtt.cmd_qs[tag].put("esync_arm")
     armed = _gather_named("esync_armed", order, timeout=30)
@@ -218,15 +225,34 @@ def _segment_round(pairs, channels):
     return segments
 
 
-def _round(order, programs, slot_us, listen_samples, exc, transport, channels):
-    """One shot: load, trigger, collect, segment."""
+def _round(order, programs, slot_us, listen_samples, exc, transport, channels,
+           exc_power):
+    """One shot: load, trigger, collect, segment.
+
+    Over the air the carrier is muted for everything but the trigger and the
+    slots. Its 3rd harmonic lands in 2.4 GHz for any point in 800-828 MHz,
+    and with it parked there the tags' WiFi either crawls or drops -- and a
+    tag that has dropped cannot re-associate until it goes away. Muted, the
+    program load, the sqr readback (the run's biggest transfer) and any
+    reconnect all happen in clean air, and the carrier is up only for the
+    fraction of a second the round actually needs it.
+    """
+    wireless = transport == mtt.WIRELESS
+    if wireless:
+        exc.set_pwr(exciters.OFF_POWER)
     _load_programs(order, programs, slot_us, listen_samples)
 
     esync_reports = {}
     fire_wait = None
-    if transport == mtt.WIRELESS:
-        start, stop, esync_reports, fire_wait = _trigger_wireless(
-            order, slot_us, exc)
+    if wireless:
+        try:
+            start, stop, esync_reports, fire_wait = _trigger_wireless(
+                order, slot_us, exc, exc_power)
+        finally:
+            # Only once every tag has answered esyncr with a lock (or the
+            # deadline passed): a tag answers that only after its last slot
+            # boundary, so no tag is still recording when the carrier goes.
+            exc.set_pwr(exciters.OFF_POWER)
         skew_ms = None
         # Goes before the traces are fetched: a tag that never locked explains
         # itself with peak_rho, which is a far better message than whatever
@@ -245,7 +271,7 @@ def _round(order, programs, slot_us, listen_samples, exc, transport, channels):
 
 
 def run_round(order, programs, slot_us, listen_samples, exc, transport,
-              channels):
+              channels, exc_power):
     """One round, re-shot if any part of it is lost.
 
     Nothing from a failed shot is kept, and leftover answers are drained first
@@ -260,7 +286,7 @@ def run_round(order, programs, slot_us, listen_samples, exc, transport,
             mtt._drainResults(mtt.result_q)
         try:
             return _round(order, programs, slot_us, listen_samples, exc,
-                          transport, channels)
+                          transport, channels, exc_power)
         except Exception as e:
             last = e
             print(f"  round: attempt {attempt}/"
@@ -323,7 +349,7 @@ def mainMultiple(num_exp_runs, exp_name, save_path,
             print(f"skipping {jammed} MHz: {lo:g}-{hi:g} MHz jams the tags' "
                   f"WiFi over the air, so a wireless run cannot reach them. "
                   f"Run them with CONNECTION: wired.")
-        if not freq_range:
+        if len(freq_range) == 0:
             raise Exception(
                 f"every frequency asked for is inside "
                 f"esync_mpp.WIFI_JAMMED_MHZ {esync_mpp.WIFI_JAMMED_MHZ}, so a "
@@ -400,7 +426,7 @@ def mainMultiple(num_exp_runs, exp_name, save_path,
                      mpp_start_time, mpp_stop_time, skew_ms,
                      fire_wait) = run_round(
                         order, programs, slot_us, listen_samples, exc,
-                        transport, channels)
+                        transport, channels, exc_power)
                     rep_end = time.time()
 
                     summary = sched_collect.slot_summary(reports)

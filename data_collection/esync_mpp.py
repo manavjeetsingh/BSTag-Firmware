@@ -67,6 +67,7 @@ FIRE_DEADLINE_S = 15.0
 # 800-828 MHz (2400-2483.5 / 3) -- so 805 and 825 still go out, and they are
 # the ones to look at if a run dies with an AP on channel 1-3 or 12-13.
 WIFI_JAMMED_MHZ = (810.0, 820.0)
+# WIFI_JAMMED_MHZ = (None, None)
 
 
 def wifi_jammed(freq_mhz):

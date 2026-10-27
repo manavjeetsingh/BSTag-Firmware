@@ -622,7 +622,7 @@ def mainMultiWays(num_exp_runs, exp_name, save_path,
             print(f"skipping {jammed} MHz: {lo:g}-{hi:g} MHz jams the tags' "
                   f"WiFi over the air, so a wireless run cannot reach them. "
                   f"Run them with CONNECTION: wired.")
-        if not freq_range:
+        if len(freq_range) == 0:
             raise Exception(
                 f"every frequency asked for is inside "
                 f"esync_mpp.WIFI_JAMMED_MHZ {esync_mpp.WIFI_JAMMED_MHZ}, so a "
